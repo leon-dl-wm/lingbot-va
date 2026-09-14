@@ -15,6 +15,7 @@
 6. [快速上手:五步跑通训练](#6-快速上手五步跑通训练)
 7. [关键配置参数速查表](#7-关键配置参数速查表)
 8. [常见坑与 FAQ](#8-常见坑与-faq)
+9. [论文与代码一致性分析](#9-论文与代码一致性分析)
 
 ---
 
@@ -525,6 +526,102 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 ### Q6:训练时 chunk_size / window_size 为什么随机?
 模拟推理时的各种配置,让模型见多识广 —— 这是 train.py `_prepare_input_dict` 里
 `torch.randint` 的用意,不是 bug。
+
+---
+
+## 9. 论文与代码一致性分析
+
+> 本章对比 `LingBot_VA_paper.pdf`(31 页,arXiv 2601.21998)与本仓库代码
+> (模型 `model.py`、训练 `train.py`、推理 `wan_va_server.py`、评测客户端、全部配置)。
+> **结论先行:核心算法框架高度一致;但论文描述的模型架构与发布代码不是同一个变体,
+> 且论文两大效率类贡献(异步推理、部分去噪)未在发布代码中启用。**
+
+### 9.1 总体结论
+
+| 维度 | 一致性 |
+|---|---|
+| 核心算法(AR 扩散、flow matching、因果掩码、teacher forcing) | ✅ 高度一致 |
+| 模型架构(双流 MoT vs 共享主干) | ❌ 论文 ≠ 发布代码 |
+| 异步推理(Algorithm 2 / FDM) | ❌ 未实现(代码为同步) |
+| 部分去噪(s=0.5/0.6) | ❌ 机制存在但未启用 |
+| KV Cache 持久记忆 | ⚠️ 有界滑动窗口,非全轨迹 |
+| 训练/推理超参 | ⚠️ 大体一致,细节有出入 |
+
+README News 已承认发布的是 **shared backbone** 版本
+("Weights and code for shared backbone released! Please stay tuned for our separated version"),
+但论文正文通篇描述的是**双流 MoT(separated)版本**。
+
+### 9.2 高度一致的部分 ✅
+
+| 论文内容 | 代码实现 | 位置 |
+|---|---|---|
+| AR 扩散 video-action 世界模型,交错序列 chunk 式自回归 | `forward_train` 四段拼接 [噪声视频\|干净视频\|噪声动作\|干净动作] | `model.py` |
+| Flow matching(速度预测 + Euler solver) | `training_target = noise - sample`;`step()` 为 Euler 积分 | `scheduler.py` |
+| Wan2.2-5B 主干:30 层、d=3072、RoPE、48ch、patchify 2× | `num_layers=30, 24×128=3072, patch_size=(1,2,2)` | `model.py` |
+| Wan2.2 因果 VAE(4×16×16)+ 流式编码 | `WanVAEStreamingWrapper`(WanCausalConv3d 缓存) | `modules/utils.py` |
+| 冻结 T5(UMT5)cross-attention 注入;训练用预计算 embedding | ✓(训练只加载 transformer) | `train.py` |
+| Teacher forcing 因果掩码(论文图3):视频块只看 a<t(式8),动作块看预测视频块(式9,逆动力学);块内双向注意力 | `_get_mask_mod` 的 `noise2clean/noise2noise/block_causal` 精确实现 | `model.py` |
+| Noisy History Augmentation:p=0.5,s∈[0.5,1](式10) | `noisy_cond_prob=0.5, min/max_timestep_bd=0.5/1.0` | `train.py` |
+| 变长 chunk 训练 K∈[1,4] | `torch.randint(1, 5)` | `train.py` |
+| L = Ldyn + λLinv(λ=1);CFG 文本 dropout 0.1;grad clip 2.0;bf16 | 全部一致 | `train.py` |
+| 视频 CFG=5.0 / 动作 CFG=1.0 | `guidance_scale=5, action_guidance_scale=1` | 各 config |
+| 30 维双臂动作 + 分位数归一化(q01/q99) | `action_dim=30, action_norm_method='quantiles'` | config + dataset |
+| Algorithm 1 同步 KV-cache 推理:生成视频块→动作块→执行→用真实观测替换预测(`clear_pred_cache`) | `_infer` + `_compute_kv_cache` | `wan_va_server.py` |
+| RoboTwin:50Hz→12.5Hz 降采样、50Hz 动作、50K steps、lr 1e-5 | `action_per_frame=16`(=4帧×4动作)、`num_steps=50000` | config |
+
+### 9.3 关键不一致(按严重程度)❌
+
+**① 模型架构:论文 ≠ 发布代码(最大差距)**
+
+- 论文:双流 MoT,视频流 d=3072 + 动作流 d=768(独立 QKV/transformer 参数),
+  额外 ~350M 参数,总计 5.3B
+- 代码:单一共享主干(~5.0B),动作 token 经 `action_embedder: Linear(30→3072)` 投影后
+  与视频 token 走**同一组** 30 层 blocks,动作专属参数仅 ~45-90M
+- 论文的动作流初始化(视频权重插值 + α=√(dv/da) 缩放,论文图7消融)和
+  "动作编解码器为隐层 256 的单层 MLP"在代码中均不存在
+- README News 承诺的 "separated version"(双流 MoT)尚未发布
+
+**② 异步推理(Algorithm 2 / FDM-grounded Async)未实现**
+
+- 论文三大贡献之一(执行与预测并行、2× 加速、消融表 90.4 vs 92.9)
+- 代码:LIBERO/RoboTwin 两个 client 均为**同步**循环(预测→执行→缓存反馈),
+  无线程/asyncio;`imagine=False` 参数是死代码;式13 的 FDM 损失也不在训练代码中
+  (只有 latent_loss + action_loss)
+- 注:论文主表数字(92.9)对应消融表 Baseline 行,即同步模式,与发布代码一致;
+  未发布的是提速变体
+
+**③ 部分去噪(s=0.5/0.6)未启用**
+
+- 论文 §3.3/§4.2/Algorithm 1:"视频积分到 s=0.5"、"3 步视频(到 s=0.6)+ 10 步动作"
+- 代码:`video_exec_step` 机制存在但所有配置均为 -1(视频**完全去噪**);
+  步数也不符——demo 5/10,LIBERO 20/50,RoboTwin 25/50
+
+**④ KV-cache 是有界滑动窗口而非"全轨迹持久记忆"**
+
+- 论文:"persistent memory across the entire trajectory"、"complete observation history"
+- 代码:`attn_window=30/72`(仅 15/36 个 chunk,满则淘汰最旧);训练注意力窗口随机 [4,64]
+
+### 9.4 次要差异 ⚠️
+
+| 项目 | 论文 | 代码 |
+|---|---|---|
+| 部署 chunk K | 统一 K=4 | LIBERO/demo=4 ✓,RoboTwin=2 |
+| τ(每视频帧动作数) | τ=4 | 仅 RoboTwin 匹配;LIBERO τ=1,demo τ=2,franka τ=5 |
+| N=192 tokens/帧 | pretraining(3×256²) | 评测配置不同:RoboTwin 120、LIBERO 32、demo 128 |
+| LR scheduler | cosine 退火+线性 warmup(pretrain) | warmup+恒定(post-train);weight decay 0.1 vs 0.01 |
+| Episode packing 至 10K tokens | ✓(pretrain) | 无(单 segment 样本) |
+| LIBERO 步数 | 4K | 配置 5000 |
+| 未披露的训练细节 | — | bell 形时间步损失加权、frame-wise 损失归一化、SNR shift(视频5.0/动作0.05~1.0)、RoboTwin 相对位姿变换与 T 形相机布局、首 chunk 首帧 dummy 动作跳过 |
+| 未发布部分 | 1.4T token 预训练、6 数据集、真实机器人部署(500 steps/lr 1e-4/seq 150K) | 仅 post-training + 仿真评测 |
+
+### 9.5 对使用者的建议
+
+1. **复现论文主表结果**:发布代码(同步模式 + shared backbone 权重)大体对应论文主表数字,
+   但需注意推理步数配置与论文文字不符
+2. **若目标是完全对齐论文**:需等待 "separated version"(双流 MoT)发布,
+   并自行实现 Algorithm 2 异步管线与 `video_exec_step` 部分去噪
+3. **论文本身的小问题**:Algorithm 2 下标混用两种约定(a_t→z_t vs a_t→z_{t+1}),
+   与其式8的条件模式存在张力;代码的同步实现反而与式8/9严格一致
 
 ---
 
