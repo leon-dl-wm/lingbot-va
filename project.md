@@ -16,7 +16,7 @@
 7. [关键配置参数速查表](#7-关键配置参数速查表)
 8. [常见坑与 FAQ](#8-常见坑与-faq)
 9. [论文与代码一致性分析](#9-论文与代码一致性分析)
-
+10. [BW1000/DCU 平台适配 Review 与跑通指南](#10-bw1000dcu-平台适配-review-与跑通指南)
 ---
 
 ## 1. 一句话理解本项目
@@ -634,3 +634,194 @@ README News 已承认发布的是 **shared backbone** 版本
   2. `wan_va/modules/model.py` 的 `forward_train` + `FlexAttnFunc.init_mask`(核心机制)
   3. `wan_va/train.py` 的 `_add_noise` → `compute_loss`(训练闭环)
   4. `wan_va/wan_va_server.py` 的 `_infer` → `_compute_kv_cache`(推理闭环)
+
+---
+
+# 10. BW1000/DCU 平台适配 Review 与跑通指南
+
+> 本章为 2026-09-15 在 **腾讯云 TI-ONE DCU 节点**上的实测评估报告。
+> 结论先行:**Post-Training LingBot-VA 可以在本平台跑通**,核心算子/分布式路径已逐项实测验证;
+> 但存在 **1 个高危问题(磁盘将爆)**、2 个必改的代码/脚本问题、1 个仅影响多卡推理的 HCCL 缺陷。
+
+## 10.1 平台环境实测
+
+| 项目 | 实测值 |
+|---|---|
+| 机器 | 300C / 2000G 内存 / **8 × HCC-BW1000**(hy-smi 显示 `BW1000_H`,单卡 ~64GB,80 CU,warpSize 64) |
+| 镜像 | `dtk26.04-torch2.7.1-py3.11-hccpd1-hccl-v1.0-vla-openpi-torchcodec` |
+| 软件栈 | DTK 26.04(ROCm/HIP 二次开发)、torch **2.7.1**+das.opt1.dtk2604、HIP 6.3.26093、triton 3.1.0 |
+| 通信库 | NCCL 后端 → **RCCL 2.22.3**(海光定制,`backend="nccl"` 直接可用) |
+| flash-attn | **2.6.1 DCU 适配版**(已预装,可导入,供推理 `attn_mode='flashattn'`) |
+| 已装关键包 | einops/scipy/wandb/safetensors/cv2/msgpack/websockets/av(pyav 17.0.1)/torchcodec/accelerate/datasets 3.6.0 |
+| 缺失包 | diffusers、easydict、ftfy、lerobot 版本错误(装的是 0.1.0,需 0.3.3)、transformers 4.53.2 且与 huggingface-hub 1.31 冲突 |
+| 存储 | `/`(overlay 200G,剩 104G)⚠️;`/home/tione/notebook`(**Lustre CFS 10T**,仅用 60G)✅;`/run`(本地盘 12T) |
+| 网络 | huggingface.co ✅ / modelscope.cn ✅ / PyPI ✅ 均可达 |
+
+**注意:进入容器后必须先 `source /opt/dtk/env.sh`,否则 `import torch` 报 `libgalaxyhip.so.5 not found`。**
+
+## 10.2 与官方要求的差距分析
+
+| 组件 | 官方要求 | 本机 | 评估 |
+|---|---|---|---|
+| Python | 3.10.16 | 3.11.9 | ✅ 兼容 |
+| PyTorch | 2.9.0 + CUDA 12.6 | 2.7.1 + DTK 26.04 | ⚠️ 降版本,但训练用到的全部关键 API(flex_attention / FSDP2 `fully_shard` / `checkpoint_wrapper` / `get_model_state_dict` / fused AdamW)已实测可用 |
+| diffusers | 0.36.0 | 未装 | ✅ venv 安装 0.36.0 验证通过 |
+| transformers | 4.55.2 | 4.53.2 + hub 冲突 | ✅ venv 安装 4.55.2 验证通过 |
+| flash-attn | 最新版 | 2.6.1 DCU 版 | ✅ 仅推理需要;训练用 `flex` 不用它 |
+| lerobot | 0.3.3 | 0.1.0 | ✅ venv `--no-deps` 安装 0.3.3,数据集代码用到的 API(`LeRobotDatasetMetadata.get_episode_chunk` 等)全部存在 |
+| CUDA 12.6 | — | 无 CUDA,DTK 等价替代 | ✅ `torch.cuda.*` 语义保留 |
+
+## 10.3 实测验证清单(全部在本机 8×BW1000 上完成)
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | torch 识别 8 卡、bf16 matmul | ✅ |
+| 2 | **flex_attention + torch.compile(dynamic=True) + create_block_mask**(训练核心) | ✅ 与 SDPA 因果基线 mean diff 0.00125(bf16 正常量级) |
+| 3 | **FSDP2 fully_shard + MixedPrecisionPolicy + HCCL 2 卡**:fwd/bwd/all_reduce(AVG)/barrier(torchrun 启动) | ✅ |
+| 4 | fused AdamW(`fused=True, foreach=False`) | ✅ |
+| 5 | 激活检查点 `checkpoint_wrapper` | ✅ |
+| 6 | 完整训练 import 链(venv:diffusers 0.36 + transformers 4.55.2 + lerobot 0.3.3 + easydict + ftfy) | ✅ `python -m wan_va.train --help` 通过 |
+| 7 | **WanTransformer3DModel(小模型)forward_train + backward 上卡**:flex 块因果掩码、RoPE、双流拼接、文本交叉注意力全通,梯度正常回传 | ✅ |
+| 8 | flash_attn 2.6.1 导入(推理路径) | ✅ |
+| 9 | `dist.broadcast_object_list`(NCCL/HCCL) | ❌ **损坏**:rank1 报 1EB 分配 / EOFError。仅影响**多卡推理 server**(`sever_utils.py`),训练不用。已验证可行 workaround:① 定长字节张量手动 broadcast;② 辅助 gloo 进程组 |
+
+> 补充说明 #7:模型 `forward_train` 内部把输入显式转 bf16(model.py L703-706),与 FSDP `param_dtype=bf16` 匹配;`text_emb` 必须是 bf16(数据集 .pth 里本来就是)。
+
+## 10.4 发现的问题与必改项
+
+### 🔴 P0:磁盘即将爆掉(立即处理)
+
+数据集正在下载到 `/root/.cache/modelscope`(**200G overlay,仅剩 104G**):
+- `robotwin-clean-and-aug-lerobot.tar.gz.ab` 52G 已完成,`.aa` 44.5G+ 仍在下载(分卷未下完);
+- 解压还需要接近等量空间 → **当前盘必然不够**。
+
+**处理**:终止当前下载,改下载/解压到 `/home/tione/notebook`(10T CFS):
+```bash
+kill 119637   # 当前 modelscope 下载进程
+mkdir -p /home/tione/notebook/data/robotwin-dataset
+modelscope download --dataset Robbyant/robotwin-clean-and-aug-lerobot \
+    --local_dir /home/tione/notebook/data/robotwin-dataset
+# 解压分卷
+cd /home/tione/notebook/data/robotwin-dataset
+cat robotwin-clean-and-aug-lerobot.tar.gz.* | tar xz
+```
+(已下载的 94G 分卷可先从 /root/.cache 移到 CFS 再续传,避免重复下载)
+
+### 🟠 P1:两处必改的代码/脚本问题
+
+1. **`key=value` 命令行覆盖不工作**。README/第 6 章写的
+   `bash script/run_va_posttrain.sh batch_size=1 gradient_accumulation_steps=8` 会直接报
+   `unrecognized arguments`——`train.py` 的 argparse 只接受 `--config-name` / `--save-root`。
+   **改参数必须编辑 `wan_va/configs/va_robotwin_train_cfg.py`。**
+2. **wandb 必失败**。`run_va_posttrain.sh` 里 `WANDB_API_KEY="your key"` 是占位符,而配置
+   `enable_wandb = True` → `wandb.login()` 必报错。**把配置里 `enable_wandb` 改为 `False`**(或填真实 key)。
+
+### 🟡 P2:已知但不阻塞
+
+| 问题 | 影响 | 说明 |
+|---|---|---|
+| `broadcast_object_list` 在 HCCL 上损坏 | 仅多卡推理 server(`launch_server_multigpus.sh`) | 单卡推理/训练不受影响;需要时用手动字节 broadcast 或 gloo 组修补 `sever_utils.py` |
+| `lerobot_latent_dataset.py` L139 `get_safe_version` 未导入 | 数据文件缺失时才触发 NameError | 本地完整数据集走不到该分支 |
+| `MultiLatentLeRobotDataset` 每 rank 起 `Pool(128)` 初始化 | 8 卡 × 128 = 1024 进程,启动慢 | 300C 可承受;嫌慢可把 `num_init_worker` 调小(如 32) |
+| RoboTwin/LIBERO 仿真评测依赖 sapien+vulkan | DCU 上未验证 | 建议先用 **i2va demo** 验证推理闭环 |
+
+## 10.5 跑通 Post-Training 的完整步骤(Runbook)
+
+### 第 0 步:环境(一次性,已验证)
+
+```bash
+source /opt/dtk/env.sh    # 每个新 shell 都要先执行!
+cd /home/tione/notebook/code/lingbot-va
+
+# venv 复用系统 torch/flash-attn,只补缺的包(避免污染镜像全局环境)
+python -m venv --system-site-packages ./va_env
+./va_env/bin/pip install "diffusers==0.36.0" "transformers==4.55.2" easydict ftfy
+./va_env/bin/pip install --no-deps "lerobot==0.3.3"
+```
+
+### 第 1 步:下载底座模型(~10GB,bf16)
+
+```bash
+modelscope download --model Robbyant/lingbot-va-base \
+    --local_dir /home/tione/notebook/model/lingbot-va-base
+# 或 huggingface-cli download robbyant/lingbot-va-base --local-dir ...
+```
+
+### 第 2 步:数据集(见 P0,下载+解压到 CFS)
+
+解压后确认结构:`meta/info.json`、`meta/episodes.jsonl`(含 `action_config`)、
+`videos/`、`latents/`、以及 **`empty_emb.pt`**(配置要求它在 dataset_path 根下;若解压后不在,从子目录找一下并放对位置)。
+
+### 第 3 步:改配置(编辑 `wan_va/configs/va_robotwin_train_cfg.py`)
+
+```python
+va_robotwin_train_cfg.dataset_path = '/home/tione/notebook/data/robotwin-dataset/<解压出的数据根目录>'
+va_robotwin_train_cfg.enable_wandb = False          # ← 必改
+va_robotwin_train_cfg.batch_size = 1                # 8卡×1,官方默认
+va_robotwin_train_cfg.gradient_accumulation_steps = 4   # 有效batch=32(官方建议≥32)
+```
+以及 `wan_va/configs/va_robotwin_cfg.py`:
+```python
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/home/tione/notebook/model/lingbot-va-base"
+```
+
+### 第 4 步:切换 attn_mode 为训练模式
+
+编辑 `/home/tione/notebook/model/lingbot-va-base/transformer/config.json`,
+把 `"attn_mode"` 改为 **`"flex"`**(训练必须;推理再改回 `"torch"` 或 `"flashattn"`)。
+
+### 第 5 步:启动 8 卡训练
+
+```bash
+source /opt/dtk/env.sh
+NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh
+```
+注意脚本里 `python` 需用 venv 的:把脚本中 `python -m torch.distributed.run` 前面加
+`export PATH=$(pwd)/va_env/bin:$PATH`,或直接把 `python` 改成 `$(pwd)/va_env/bin/python`。
+
+**健康检查**:
+- `watch -n 1 hy-smi` 看 8 卡利用率/显存(预期单卡 ~15-25GB,64GB 卡很富余);
+- tqdm 里 `latent_loss`/`action_loss` 前几百步明显下降、`grad_norm` 个位数;
+- checkpoint 输出在 `save_root/checkpoints/checkpoint_step_N/transformer/`(diffusers 格式,bf16)。
+
+### 第 6 步:训后推理验证(i2va demo,不需要仿真环境)
+
+```bash
+# 1) 把 checkpoint 的 transformer/config.json 里 attn_mode 改回 "torch"
+# 2) 配置 wan22_pretrained_model_name_or_path 指向 checkpoint 目录
+NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
+# 生成 demo.mp4,直观看到"想象的未来视频 + 动作"
+```
+
+## 10.6 性能与资源预期(依据海光官方实测 PDF)
+
+| 参考模型(同生态) | BW1000 表现 | 对标 |
+|---|---|---|
+| **Fastwam**(世界动作模型,与本模型最接近,同栈 DTK26.04+torch2.7.1+py3.11) | 单机 8 卡 30.31 samples/s | H20 的 **66.3%**(开箱) |
+| LingBot-VLA(同团队) | 7.11~10.66 samples/s | H20 的 **77%~127%** |
+| Pi0.5(openpi,本镜像即为 openpi 场景) | 51.2 samples/s,10.0 s/step,峰值显存 52.84G | H20 的 **1.3×** |
+| Wan2.2-5B(本模型底座) | — | A800 5.43 smp/s/gpu |
+
+- **开箱预期**:约为 H20 的 66%~100%,可用但非最优;官方优化方向:gemm 优化、算子融合
+  (fa 换自研算子)、数据排布适配、**HyperAcc 加速包**(RoPE+GELU×MUL+RMSNorm 融合,实测 +17~18%)。
+- **显存**:5B 模型 FSDP fp32 参数+AdamW 状态 ≈ (4+4+8)B × 5B / 8 卡 ≈ 10GB/卡,
+  加 bf16 计算副本与激活(batch=1 + AC),单卡 64GB 富余,可尝试更大 batch。
+- **量化提示**:BW1000 **不支持 FP8**,支持 INT8(训练场景用不到)。
+- **性能分析**:用 `tiprof --steps 5-10 ...`(TI-Profiler)或海光原生 `hipprof`;**不要用 nsys**。
+
+## 10.7 风险清单(按优先级)
+
+| 级别 | 风险 | 缓解 |
+|---|---|---|
+| 🔴 | 磁盘爆盘(数据集下载位置错误) | 立即按 10.4-P0 迁移到 CFS |
+| 🟠 | wandb 占位 key 导致启动失败 | `enable_wandb=False` |
+| 🟠 | key=value 覆盖不生效导致误以为改了参数 | 直接编辑配置文件 |
+| 🟡 | torch 2.7.1 vs 2.9 的残余差异 | 核心路径已实测;如遇奇异算子问题,反馈光合社区(附 DTK 版本) |
+| 🟡 | 多卡推理 server 的 broadcast_object_list | 用 10.3-#9 的 workaround 修补 |
+| 🟡 | 仿真评测(RoboTwin/LIBERO)在 DCU 上未验证 | 先用 i2va demo 验证;仿真评测建议放 NVIDIA 环境 |
+
+## 10.8 一句话总结
+
+**环境侧只差 4 个 pip 包(venv 5 分钟解决),模型侧零改动;真正要先动手的是把数据集下载
+从 200G 系统盘迁到 10T CFS,再把 wandb 关掉、attn_mode 切成 flex——然后就能在 8×BW1000 上
+直接 `NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh` 开训。**
