@@ -16,10 +16,14 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="your key"
-export WANDB_BASE_URL="your url"
-export WANDB_TEAM_NAME="your team name"
-export WANDB_PROJECT="your project"
+# WandB: set WANDB_MODE=offline for credential-free local logging (sync later with
+# `wandb sync`), or fill real values below for online logging.
+export WANDB_MODE=${WANDB_MODE:-"offline"}
+export WANDB_API_KEY=${WANDB_API_KEY:-"your key"}
+export WANDB_BASE_URL=${WANDB_BASE_URL:-"your url"}
+export WANDB_TEAM_NAME=${WANDB_TEAM_NAME:-"your team name"}
+export WANDB_PROJECT=${WANDB_PROJECT:-"va_robotwin"}
+export WANDB_RUN_NAME=${WANDB_RUN_NAME:-"robotwin_train"}
 
 ## node setting
 num_gpu=${NGPU}

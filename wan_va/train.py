@@ -50,15 +50,18 @@ import gc
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            # WANDB_MODE=offline works without credentials; online requires
+            # WANDB_BASE_URL / WANDB_API_KEY / WANDB_TEAM_NAME to be set.
+            if os.environ.get("WANDB_MODE", "online") == "online":
+                wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
+                entity=os.environ.get("WANDB_TEAM_NAME", None),
                 project=os.getenv("WANDB_PROJECT", "va_robotwin"),
                 # dir=log_dir,
                 config=config,
-                mode="online",
-                name='test_lln'
+                mode=os.environ.get("WANDB_MODE", "online"),
+                name=os.getenv("WANDB_RUN_NAME", 'va_posttrain')
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
