@@ -874,6 +874,19 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 
 ## 11.4 🔴 TODO:训练侧 lerobot 0.6.2(v3.0)与官方 v2.1 数据集不兼容
 
+> **✅ 已解决(2026-09-18):方案 B 已实施并实测跑通。**
+> `wan_va/dataset/lerobot_latent_dataset.py` 已重写为**完全脱离 lerobot 包**的独立读取器:
+> 直接解析 `meta/info.json` + `meta/episodes.jsonl`(含 `action_config`)+ 按 `data_path`
+> 模板逐 episode 读 action parquet(pyarrow),自行累加 length 构建 `episode_data_index`、
+> `episode_chunk = idx // chunks_size`。对官方 v2.1 数据即用,不受 lerobot 版本影响。
+> 顺带修复:① `Pool(128)` fork 死锁(主进程已有 torch/NCCL 线程时 fork 子进程继承持锁),
+> 改为 repo 数 ≤2 时进程内串行构建、否则用 `spawn` 上下文 Pool;② 消除了原
+> `packaging`/`get_safe_version` 未导入的历史 NameError。
+> 实测(libero-long-lerobot,500 episodes):loader 0.75s 构建完成,单卡训练 4+ 步,
+> `latent_loss≈0.14-0.17`、`action_loss≈0.39-0.50`、`grad_norm≈3.3-4.0`,约 70-90s/step
+> (grad_accum=10,GB10 低带宽下属预期)。数据集缺 `empty_emb.pt` 时用底座 UMT5 对空串
+> 编码生成(与 server `_get_t5_prompt_embeds` 一致,(512,4096) bf16,仅 1 个有效 token)。
+
 **现象:** `python -m wan_va.train` 在 `from lerobot.datasets.utils import get_episode_data_index`
 即 `ImportError`。根因不是版本号,而是**数据集格式代差**:
 
@@ -917,4 +930,5 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 ## 11.6 一句话总结
 
 **DGX Spark 上推理/评估依赖链已打通(改了 flash_attn 可选导入 + 装 scipy/imageio/wandb),下载权重即可跑 i2va;
-训练侧因 lerobot 0.6.2(v3.0)与官方 v2.1 数据集格式代差被卡住,已在 11.4 留 TODO,推荐用"解耦 loader"方案(B)。**
+训练侧 lerobot 0.6.2(v3.0)与官方 v2.1 数据集的格式代差已用"解耦 loader"方案(B)解决——loader 不再依赖
+lerobot 包,libero-long 数据集单卡训练已实测跑通(见 11.4 顶部更新)。**

@@ -1,19 +1,22 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
-from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+# Standalone LeRobot v2.1-format reader (decoupled from the lerobot package,
+# see project.md 11.4 Plan B): reads meta/info.json + meta/episodes.jsonl
+# (including the custom `action_config` field) and per-episode action parquet
+# files directly, so it works with any installed lerobot version. Videos are
+# consumed as pre-extracted latents (.pth) and never decoded here.
+import json
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
+import multiprocessing
 from functools import partial
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
-from lerobot.constants import HF_LEROBOT_HOME
+import pyarrow.parquet as pq
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -40,16 +43,20 @@ def construct_lerobot(
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
-    datasets_out_lst = []
     construct_func = partial(
         construct_lerobot,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
+    if len(repo_list) <= 2:
+        # Build in-process: forking pool workers from a parent that already has
+        # torch/NCCL threads can deadlock (children inherit held locks).
+        return [construct_func(repo_id) for repo_id in repo_list]
+    # 'spawn' workers start clean without inherited locks (fork is unsafe here).
+    ctx = multiprocessing.get_context('spawn')
+    with ctx.Pool(min(num_init_worker, len(repo_list))) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
-                
     return datasets_out_lst
 
 def get_relative_pose(pose):
@@ -105,59 +112,82 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
         return cur_dset[local_idx]
 
-class LatentLeRobotDataset(LeRobotDataset):
+class LatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         repo_id,
         config=None,
     ):
         self.repo_id = repo_id
-        self.root = HF_LEROBOT_HOME / repo_id
-        self.image_transforms = None
-        self.delta_timestamps = None
-        self.episodes = None
-        self.tolerance_s = 1e-4
-        self.revision = "v2.1"
-        self.video_backend = 'pyav'
-        self.delta_indices = None
-        self.batch_encoding_size = 1
-        self.episodes_since_last_encoding = 0
-        self.image_writer = None
-        self.episode_buffer = None
-        self.root.mkdir(exist_ok=True, parents=True)
-        self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=False
-        )
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
-        
-        try:
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
-        self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
-        
-        self.latent_path = Path(repo_id) / 'latents'
+        self.root = Path(repo_id)
+        if not (self.root / 'meta' / 'info.json').is_file():
+            raise FileNotFoundError(
+                f"meta/info.json not found under {self.root}; "
+                "dataset_path must point to a local LeRobot v2.1-format repo")
+
+        with open(self.root / 'meta' / 'info.json') as f:
+            self.info = json.load(f)
+        self.chunks_size = self.info.get('chunks_size', 1000)
+        self.data_path_tpl = self.info.get(
+            'data_path',
+            'data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet')
+
+        self.episodes = self._load_episodes()
+        self.episode_data_index = self._build_episode_data_index()
+        self.all_actions = self._load_actions()
+
+        self.latent_path = self.root / 'latents'
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
-        self._hf_torch_view = self.hf_dataset.with_format(
-                type='torch',
-                columns=['action'],
-                output_all_columns=False
-            )
         self.parse_meta()
+
+    def _load_episodes(self):
+        episodes = []
+        with open(self.root / 'meta' / 'episodes.jsonl') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    episodes.append(json.loads(line))
+        episodes.sort(key=lambda ep: ep['episode_index'])
+        return episodes
+
+    def _build_episode_data_index(self):
+        starts = np.zeros(len(self.episodes), dtype=np.int64)
+        acc = 0
+        for i, ep in enumerate(self.episodes):
+            starts[i] = acc
+            acc += ep['length']
+        return {'from': starts, 'to': starts + np.array(
+            [ep['length'] for ep in self.episodes], dtype=np.int64)}
+
+    def get_episode_chunk(self, episode_index):
+        return episode_index // self.chunks_size
+
+    def _episode_parquet_path(self, episode_index):
+        rel = self.data_path_tpl.format(
+            episode_chunk=self.get_episode_chunk(episode_index),
+            episode_index=episode_index)
+        return self.root / rel
+
+    def _load_actions(self):
+        actions = []
+        for ep in tqdm(self.episodes, desc=f'loading actions [{self.root.name}]'):
+            idx = ep['episode_index']
+            table = pq.read_table(self._episode_parquet_path(idx),
+                                  columns=['action'])
+            arr = np.stack(table.column('action').to_pylist()).astype(np.float32)
+            assert len(arr) == ep['length'], (
+                f"episode {idx}: parquet rows {len(arr)} != meta length {ep['length']}")
+            actions.append(arr)
+        return np.concatenate(actions, axis=0)
 
     def parse_meta(self):
         out = []
-        for key, value in self.meta.episodes.items():
+        for value in self.episodes:
             episode_index = value["episode_index"]
             tasks = value["tasks"]
             action_config = value["action_config"]
@@ -179,7 +209,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
-        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        episode_chunk = self.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
         for key in self.used_video_keys:
             cur_path = latent_path / key
@@ -195,8 +225,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         return local_index + ep_start
 
     def _get_range_hf_data(self, start_frame, end_frame):
-        batch = self._hf_torch_view[start_frame:end_frame]
-        return batch
+        return {'action': torch.from_numpy(self.all_actions[start_frame:end_frame])}
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -207,7 +236,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         return out
 
     def _get_range_latent_data(self, start_frame, end_frame, episode_index):
-        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        episode_chunk = self.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
         out = {}
         for key in self.used_video_keys:
