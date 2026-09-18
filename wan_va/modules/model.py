@@ -28,8 +28,14 @@ from functools import partial
 
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+except Exception:
+    try:
+        from flash_attn import flash_attn_func
+    except Exception:
+        # flash-attn is only needed for attn_mode='flashattn'. Training uses
+        # 'flex' and inference can use 'torch', so keep the import optional
+        # (e.g. on aarch64/Blackwell where prebuilt flash-attn is unavailable).
+        flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -302,6 +308,11 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
+            if flash_attn_func is None:
+                raise ImportError(
+                    "attn_mode='flashattn' requires flash-attn, which is not installed. "
+                    "Install flash-attn or set attn_mode to 'torch' (inference) / 'flex' (training)."
+                )
             self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)

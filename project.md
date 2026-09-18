@@ -17,6 +17,7 @@
 8. [常见坑与 FAQ](#8-常见坑与-faq)
 9. [论文与代码一致性分析](#9-论文与代码一致性分析)
 10. [BW1000/DCU 平台适配 Review 与跑通指南](#10-bw1000dcu-平台适配-review-与跑通指南)
+11. [DGX Spark(GB10/Blackwell)平台适配 Review 与 TODO](#11-dgx-sparkgb10blackwell平台适配-review-与-todo)
 ---
 
 ## 1. 一句话理解本项目
@@ -825,3 +826,95 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 **环境侧只差 4 个 pip 包(venv 5 分钟解决),模型侧零改动;真正要先动手的是把数据集下载
 从 200G 系统盘迁到 10T CFS,再把 wandb 关掉、attn_mode 切成 flex——然后就能在 8×BW1000 上
 直接 `NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh` 开训。**
+
+---
+
+# 11. DGX Spark(GB10/Blackwell)平台适配 Review 与 TODO
+
+> 本章为 2026-09-18 在 **NVIDIA DGX Spark** 上的实测评估。
+> 结论先行:**推理 / 评估依赖链已打通**(只差下载底座权重);**训练侧被 lerobot 版本不兼容卡住**,
+> 已留 TODO(见 11.4),需先定方向再动手。
+
+## 11.1 平台环境实测
+
+| 项目 | 实测值 |
+|---|---|
+| 机器 | NVIDIA **DGX Spark**,GB10 Grace Blackwell Superchip |
+| GPU | 1× **NVIDIA GB10**,compute capability **sm_121**(12,1),48 SM,24MB L2 |
+| 内存 | **128GB 统一内存**(LPDDR5x,torch 可见 130.7GB),带宽仅 **~273 GB/s**(主要瓶颈) |
+| CPU / 架构 | 20-core Arm,**aarch64**,Ubuntu 24.04.5 LTS |
+| CUDA / 驱动 | **CUDA 13.0**,driver 580.173.02 |
+| conda 环境 | `lerobot`(`conda activate lerobot`) |
+| Python | **3.13.15**(官方要求 3.10) |
+| torch | **2.11.0+cu130**(官方要求 2.9.0+cu126) |
+| 关键包 | diffusers 0.40.0 / transformers 5.17.0 / numpy 2.2.6 / triton 3.6.0 / lerobot **0.6.2**(本地源码) |
+
+> ⚠️ **不能照搬官方 `requirements.txt` 的 `torch==2.9.0+cu126`**:cu126 wheel 不含 Blackwell
+> sm_121 kernel,在 GB10 上不可用。本机已装的 `torch 2.11.0+cu130` 才是对的,**保持不降级**。
+
+## 11.2 已完成的修复(用最新版本,未降级)
+
+| # | 修复 | 说明 |
+|---|---|---|
+| 1 | **`model.py` 的 `flash_attn` 顶层导入改为可选** | 原 `try: flash_attn_interface except: flash_attn` 两者都缺时会让**模型无法 import**(训练/推理全挂)。改为再兜底 `flash_attn_func = None`,并在 `attn_mode='flashattn'` 分支加清晰报错。aarch64+Blackwell 无现成 flash-attn wheel,而 `torch`/`flex` 模式根本不调用它 → 无需编译。 |
+| 2 | 安装 `scipy 1.18.1` / `imageio[ffmpeg] 2.37.4` / `wandb 0.30.0` | robotwin 相对位姿、视频导出、日志所需。 |
+
+**修复后实测:** `WanTransformer3DModel`、`modules.utils`、`wan_va` 包、`wan_va_server` 全部 import 通过,
+`python -m wan_va.wan_va_server --help` 正常。diffusers 0.40(`prompt_clean`/`FP32LayerNorm`/
+`AutoencoderKLWan`)、transformers 5.17(`UMT5EncoderModel`/`T5TokenizerFast`)均兼容。
+
+## 11.3 可行性结论
+
+| 用途 | 可行性 | 原因 |
+|---|---|---|
+| **推理 / i2va demo** | ✅ 依赖已就绪(差权重) | 显存 ~18GB(offload)远够;但 ~273GB/s 带宽下自回归去噪(视频25+动作50步/块)会**慢** |
+| **仿真评估 RoboTwin/LIBERO** | ⚠️ 需额外装仿真器 | `sapien`+Vulkan / `robosuite`+`mujoco` 未装,aarch64+Blackwell 渲染支持待验证 |
+| **完整后训练(50k步)** | ❌ 不实用 | 单卡无 FSDP 分片收益,5B 全量微调优化器态 ~80–90GB,128GB 统一内存勉强够但很紧;单张低带宽 GB10 跑 50k 步需数天~数周 |
+| **短时训练 / 调试** | ⛔ 当前被 11.4 阻塞 | 需先解决 lerobot 不兼容 |
+
+## 11.4 🔴 TODO:训练侧 lerobot 0.6.2(v3.0)与官方 v2.1 数据集不兼容
+
+**现象:** `python -m wan_va.train` 在 `from lerobot.datasets.utils import get_episode_data_index`
+即 `ImportError`。根因不是版本号,而是**数据集格式代差**:
+
+- lerobot **0.6.2 → `CODEBASE_VERSION = "v3.0"`**(episodes 存 **parquet**,`meta.episodes` 是 HF `Dataset`)
+- 官方 `robotwin-clean-and-aug-lerobot` 是 **v2.1**(`meta/episodes.jsonl` + 自定义 **`action_config`** 字段)
+- `wan_va/dataset/lerobot_latent_dataset.py` 深度耦合 v2.1 时代 API
+
+**0.6.2 中已删/改、导致 loader 失效的点:**
+
+| 代码用到 | 0.6.2 状态 |
+|---|---|
+| `get_episode_data_index`(L3 import) | **已移除**(无替代;需自行按 episode 长度累加,或用 v3.0 的 `dataset_from_index`/`dataset_to_index`) |
+| `meta.get_episode_chunk()`(L182/210) | **已移除**(v3.0 改为每 episode 存 `meta/episodes/chunk_index`) |
+| `meta.episodes.items()`(L160) | `meta.episodes` 变 HF `Dataset`,非字典;且 v3.0 schema **无 `action_config`** |
+| `load_hf_dataset()` / `download_episodes()` / `get_episodes_file_paths()`(L136-141) | 已移走/改名(`get_episodes_file_paths` 现于 `dataset_reader.py`) |
+| `revision = "v2.1"`(L120) | 0.6.2 按 v3.0 校验(`check_version_compatibility`)会拒绝 v2.1 |
+| `HF_LEROBOT_HOME`(L16,`lerobot.constants`) | 移到 `lerobot.utils.constants` |
+| `packaging`(L131)、`get_safe_version`(L139) | **本就未 import**(历史 NameError bug;`get_safe_version` 现在 `lerobot.datasets.utils`) |
+
+**三个候选方向(待定,尚未实施):**
+
+- **B(推荐)解耦**:重写 `LatentLeRobotDataset`,**不继承 `LeRobotDataset`**,直接读
+  `meta/episodes.jsonl`(纯 JSON,含 `action_config`)+ 用 `datasets`/`pyarrow` 读 action parquet,
+  自行计算 `episode_data_index`(累加 length)与 `chunk_index`(`idx // chunk_size`)。
+  → 对官方 v2.1 数据即用,且**不受 lerobot 版本影响**。视频本就走预提取 latent(.pth),不依赖 lerobot。
+- **A 坚持用 0.6.2**:把官方数据集 v2.1→v3.0 转换(lerobot 有 `convert_dataset_v21_to_v30.py`),
+  并把自定义 `action_config` 重新注入 v3.0 episodes parquet,再按 0.6.2 API 重写 loader。**工作量最大**。
+- **C 降级**:训练单独建 `lerobot==0.3.3` 的 conda 环境(改动最小,但与"用最新版"相悖,
+  且 0.3.3 在 py3.13/torch2.11 上可能装不上)。
+
+> 备注:**底座权重与数据集本机均未下载**,故 11.4 的任何改法暂时都无法用真实数据验证。
+
+## 11.5 其他注意事项(与第 10 章一致)
+
+- 脚本默认 `NGPU=8` → 本机须 `NGPU=1`;`run_va_*.sh` 里 `export PATH="${REPO_ROOT}/va_env/bin:$PATH"`
+  指向不存在的 `va_env`(用 conda 时无害,会回落到 `lerobot` 环境的 python)。
+- `key=value` 命令行覆盖**不生效**(`train.py` argparse 只认 `--config-name`/`--save-root`),改参数须编辑配置文件。
+- 训练前把模型目录 `transformer/config.json` 的 `attn_mode` 改为 `"flex"`;推理改回 `"torch"`(本机无 flash-attn,勿用 `"flashattn"`)。
+- 若启用 wandb 失败,把配置 `enable_wandb` 改为 `False`。
+
+## 11.6 一句话总结
+
+**DGX Spark 上推理/评估依赖链已打通(改了 flash_attn 可选导入 + 装 scipy/imageio/wandb),下载权重即可跑 i2va;
+训练侧因 lerobot 0.6.2(v3.0)与官方 v2.1 数据集格式代差被卡住,已在 11.4 留 TODO,推荐用"解耦 loader"方案(B)。**
