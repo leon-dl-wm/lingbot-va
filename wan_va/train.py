@@ -331,11 +331,22 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
+            # On unified-memory platforms (e.g. DGX Spark), cached GPU blocks
+            # count against system RAM; release them before the CPU-side
+            # full-state-dict gather.
+            gc.collect()
+            torch.cuda.empty_cache()
             state_dict = get_model_state_dict(
                 self.transformer,
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
-            state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+            # Convert incrementally, freeing each fp32 tensor as it is cast:
+            # holding both full dicts at once (~30GB) can OOM the host on
+            # unified-memory machines (e.g. DGX Spark).
+            state_dict_bf16 = {}
+            for k in list(state_dict.keys()):
+                state_dict_bf16[k] = state_dict.pop(k).to(torch.bfloat16)
+            del state_dict
             # optim_state = get_optimizer_state_dict(
             #         self.transformer, self.optimizer,
             #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
