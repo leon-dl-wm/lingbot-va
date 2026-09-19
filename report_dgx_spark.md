@@ -74,6 +74,10 @@
 - `action_loss` 下降 68%(0.36→0.115),`latent_loss` 下降 15%(0.164→0.139),lr warmup 10 步后恒定 1e-5
 - grad_norm 全程 0.34~4.07,无异常尖峰
 
+![Training loss curves](assets/dgx_spark_train_loss.png)
+
+*左:latent/action loss(浅色为原始值,深色为 9 步滑动平均);右:grad_norm 与 lr(前 10 步 warmup)*
+
 ## 6. 事故与修复记录
 
 ### 6.1 🟠 Pool(128) fork 死锁(首次冒烟触发)
