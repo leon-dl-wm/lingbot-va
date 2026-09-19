@@ -2,7 +2,8 @@
 
 > 目标:在 NVIDIA DGX Spark(GB10,128GB 统一内存)上打通 LingBot-VA Post-Training 全链路,
 > 完成 libero-long 数据集 200 步验证性训练。
-> 结论先行:**方案 B(解耦 loader)实施成功,200 步训练完整跑通,checkpoint 正常落盘**;
+> 结论先行:**方案 B(解耦 loader)实施成功,200 步训练完整跑通,checkpoint 正常落盘,
+> 并用 checkpoint_step_200 完成 i2va 推理闭环验证**;
 > 期间发现并修复 2 个平台级问题(Pool fork 死锁、保存 checkpoint 时宿主机 OOM)。
 
 ---
@@ -104,26 +105,44 @@
 
 ⚠️ checkpoint 的 `config.json` 中 `attn_mode` 继承为 `"flex"`;**推理前须改为 `"torch"`**(本机无 flash-attn,勿用 `"flashattn"`)。
 
-## 8. 代码改动清单(本次新增,待提交)
+## 8. 代码改动清单
 
 | 文件 | 改动 |
 |---|---|
 | `wan_va/train.py` | `save_checkpoint` 逐张量 bf16 转换 + 保存前 gc/empty_cache(OOM 修复) |
 | `wan_va/configs/va_libero_train_cfg.py` | num_steps=200, save_interval=100, load_worker=2 |
+| `wan_va/configs/va_libero_i2va.py` | 推理配置指向 checkpoint_step_200(见 §9) |
 
-(方案 B loader 重写、libero 路径配置、project.md 更新已随 commit `a1e4a28` 提交)
+(方案 B loader 重写、libero 路径配置、project.md 更新见 commit `a1e4a28`;OOM 修复与本报告见 commit `c37cfd3`)
 
-## 9. 后续建议
+## 9. 推理闭环验证(i2va demo,2026-09-19 补充)
 
-1. **推理闭环验证**:checkpoint `attn_mode` 改 `"torch"`,`wan22_pretrained_model_name_or_path` 指向 `checkpoint_step_200`,`NGPU=1 CONFIG_NAME='libero_i2av' bash script/run_launch_va_server_sync.sh` 跑 i2va demo(注意 server 加载 UMT5+VAE+5B transformer,统一内存峰值需观察,建议 enable_offload)
-2. **正式后训练**:200 步仅为链路验证;官方建议 5000 步(本机约 **3.6 天**)。若需更长训练,建议:
+用 `checkpoint_step_200` 跑通图生视频-动作闭环:
+
+- **配置**:`va_libero_i2va.py` 覆盖 `wan22_pretrained_model_name_or_path` 指向 checkpoint_step_200
+  (训练配置仍指向 base);checkpoint 目录软链 base 的 `vae/tokenizer/text_encoder`;
+  server 侧 `load_transformer(attn_mode="torch")` 强制覆盖,**无需手改 checkpoint 的 config.json**
+- **命令**:`NGPU=1 CONFIG_NAME='libero_i2av' bash script/run_launch_va_server_sync.sh`
+- **输入**:`example/libero/` 双相机首帧 + prompt "put both the alphabet soup and the tomato sauce in the basket"
+- **结果**(10 chunks,全程 **~2 分钟**,offload 模式内存峰值仅 34G):
+  - `train_out/demo.mp4`:157 帧 128×256(双相机拼接),画面非退化(mean 62.7/std 38.6,首尾帧差异 27.4 → 有明显运动)
+  - 动作输出:10 个 chunk 共 (1, 30, 40, 4, 1),数值在归一化范围 [-1.07, 1.04](与训练 clip ±1.5 一致),std 0.222 非退化
+  - 每 chunk 的 latents/actions .pt 存于 `train_out/real/<prompt>_<时间戳>/`
+- 日志:`train_out/i2va_demo.log`
+
+> 注:200 步仅为链路验证,生成质量(动作可执行性)未经仿真评测,不代表训练收敛。
+
+## 10. 后续建议
+
+1. **正式后训练**:200 步仅为链路验证;官方建议 5000 步(本机约 **3.6 天**)。若需更长训练,建议:
    - `save_interval` 保持 ≤500,单次保存峰值已验证安全
    - 长训前确认 swap 余量,或进一步降 `load_worker`
-3. **仿真评测**(LIBERO sapien+mujoco)在 aarch64+Blackwell 上未验证,建议推理 demo 通过后再装
-4. 多卡不适用(本机 1 卡);`broadcast_object_list` 问题(仅多卡推理 server)本机无影响
+2. **仿真评测**(LIBERO sapien+mujoco)在 aarch64+Blackwell 上未验证,推理 demo 已通过,可作为下一步
+3. 多卡不适用(本机 1 卡);`broadcast_object_list` 问题(仅多卡推理 server)本机无影响
 
-## 10. 一句话总结
+## 11. 一句话总结
 
 **DGX Spark 上 LingBot-VA 后训练全链路已打通:方案 B 解耦 loader 让训练彻底摆脱 lerobot 版本约束,
 修复 fork 死锁与统一内存 OOM 两个平台级问题后,libero-long 200 步训练 3.5 小时跑通,
-action_loss 0.36→0.115,checkpoint_step_200 已落盘,可直接用于 i2va 推理验证。**
+action_loss 0.36→0.115,checkpoint_step_200 已落盘,并以其完成 i2va 推理闭环验证(~2 分钟生成
+demo.mp4 + 非退化动作序列)——训练与推理双侧均可用。**
