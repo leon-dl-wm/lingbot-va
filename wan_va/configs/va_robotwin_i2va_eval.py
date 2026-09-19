@@ -12,6 +12,10 @@ va_robotwin_i2va_eval_cfg.wan22_pretrained_model_name_or_path = os.environ.get(
     va_robotwin_cfg.wan22_pretrained_model_name_or_path,
 )
 va_robotwin_i2va_eval_cfg.enable_offload = True  # fit alongside training (~18G)
+# Reduced attention window so eval can share a GPU with training (~14G free):
+# KV cache 7.2G->2.4G with window 24 (12 chunks of history, enough for a 10-chunk demo).
+va_robotwin_i2va_eval_cfg.attn_window = 24
+va_robotwin_i2va_eval_cfg.num_chunks_to_infer = 10
 va_robotwin_i2va_eval_cfg.input_img_path = 'example/robotwin'
 va_robotwin_i2va_eval_cfg.num_chunks_to_infer = 10
 va_robotwin_i2va_eval_cfg.prompt = 'Grab the medium-sized white mug, rotate it, place it on the table, and hook it onto the smooth dark gray rack.'

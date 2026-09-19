@@ -31,6 +31,7 @@ source /opt/dtk/env.sh
 echo "=== running i2va with checkpoint_step_${STEP} ==="
 NGPU=1 CONFIG_NAME='robotwin_i2av_eval' \
     EVAL_MODEL_PATH="${EVAL_DIR}" \
+    MASTER_PORT=${MASTER_PORT:-29699} \
     bash script/run_launch_va_server_sync.sh 2>&1 | tail -30
 echo "=== output ==="
 ls -la "${REPO}/train_out/demo.mp4" 2>/dev/null || find "${REPO}" -maxdepth 2 -name "demo.mp4" -mmin -60 2>/dev/null || echo "check train_out/demo.mp4"
