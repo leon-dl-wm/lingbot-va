@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from easydict import EasyDict
+import os
 
 from .shared_config import va_shared_cfg
 
@@ -7,7 +8,7 @@ va_libero_cfg = EasyDict(__name__='Config: VA libero')
 va_libero_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_libero_cfg.wan22_pretrained_model_name_or_path = "/home/llhuang/works/dataset/lingbot-va-base"
+va_libero_cfg.wan22_pretrained_model_name_or_path = os.path.expanduser("~/works/dataset/lingbot-va-base")
 
 va_libero_cfg.attn_window = 30
 va_libero_cfg.frame_chunk_size = 4

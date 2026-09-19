@@ -24,8 +24,8 @@
 
 | 项目 | 值 |
 |---|---|
-| 底座模型 | `modelscope download --model Robbyant/lingbot-va-base` → `/home/llhuang/works/dataset/lingbot-va-base`(23G;transformer 5B bf16,`attn_mode` 已是 `"flex"`,无需修改) |
-| 数据集 | `modelscope download --dataset Robbyant/libero-long-lerobot` → `/home/llhuang/works/dataset/libero-long-lerobot`(libero_10.tgz 467M,解压后 4.9G) |
+| 底座模型 | `modelscope download --model Robbyant/lingbot-va-base` → `~/works/dataset/lingbot-va-base`(23G;transformer 5B bf16,`attn_mode` 已是 `"flex"`,无需修改) |
+| 数据集 | `modelscope download --dataset Robbyant/libero-long-lerobot` → `~/works/dataset/libero-long-lerobot`(libero_10.tgz 467M,解压后 4.9G) |
 | 数据规模 | LeRobot v2.1,500 episodes / 138,090 帧,Franka;`meta/episodes.jsonl` 含 `action_config` ✅;`latents/` 已预提取(Wan2.2 VAE,48 维,双相机 agentview + eye_in_hand,128×128) |
 | empty_emb.pt | 归档中不含;已用底座 UMT5 text_encoder 对空字符串编码生成(与 server `_get_t5_prompt_embeds` 逻辑一致,(512, 4096) bf16,有效 token=1),置于数据集根目录 |
 
@@ -49,8 +49,8 @@
 
 | 配置 | 值 | 说明 |
 |---|---|---|
-| `dataset_path` | `/home/llhuang/works/dataset/libero-long-lerobot/libero_10/0.0.0/libero_10_0.0.0_lerobot_part_0` | 必改 |
-| `wan22_pretrained_model_name_or_path` | `/home/llhuang/works/dataset/lingbot-va-base` | 必改 |
+| `dataset_path` | `~/works/dataset/libero-long-lerobot/libero_10/0.0.0/libero_10_0.0.0_lerobot_part_0` | 必改 |
+| `wan22_pretrained_model_name_or_path` | `~/works/dataset/lingbot-va-base` | 必改 |
 | `enable_wandb` | `False` | 官方脚本 wandb key 是占位符,必改 |
 | `num_steps` | **200**(默认 5000) | 验证性训练 |
 | `save_interval` | **100**(默认 200) | 中间 checkpoint,提前验证保存路径 |
