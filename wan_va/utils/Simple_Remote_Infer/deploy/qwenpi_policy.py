@@ -1,4 +1,14 @@
 """Utils for evaluating the OpenVLA policy."""
+# Notes (added): deployment/inference components for the QwenPI0 policy (a pi0-style VLA
+# built on the Qwen2.5-VL backbone). This module provides:
+# - observation preprocessing: image resize+pad, state zero-padding, PaliGemma-style text
+#   tokenization (PolicyPreprocessMixin);
+# - AdaptiveEnsembler: cosine-similarity-based adaptive action ensembling (smooths repeated predictions);
+# - QwenPiServer: websocket deployment policy wrapper supporting two execution modes —
+#   "action chunk execution" and "adaptive ensembling"; it can be passed directly as the
+#   policy argument of WebsocketPolicyServer (see the __main__ debug entry at the bottom).
+# For the dataset action-replay variant (no model inference, replays recorded actions),
+# see replay_policy.py in the same directory.
 
 import json
 import os
@@ -26,6 +36,8 @@ from transformers import (
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from veomni.models.vla.pi0 import PI0Policy, QwenPI0Policy
 
+# Fixed camera observation key order: base (head) camera + left wrist camera + right wrist camera;
+# prepare_images iterates in this order and stacks the images; missing cameras get zero placeholders with mask=False
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
@@ -34,16 +46,44 @@ IMAGE_KEYS = (
 
 
 class AdaptiveEnsembler:
+    """Adaptive action ensembler: similarity-weighted average of the current and recent predicted actions to suppress jitter.
+
+    Idea: keeps a history queue of the last pred_action_horizon predictions; after each
+    new prediction is appended, it computes the cosine similarity between every queued
+    prediction and the current one, converts similarities to weights via
+    exp(alpha * cos) (normalized), and takes the weighted average. Larger alpha gives
+    more weight to predictions that agree with the current one; alpha=0 degenerates to a
+    plain mean.
+    """
 
     def __init__(self, pred_action_horizon, adaptive_ensemble_alpha=0.0):
+        """Initialize the ensembler.
+
+        Args:
+            pred_action_horizon (int): length of the prediction history queue (ensemble window; how many past predictions to keep).
+            adaptive_ensemble_alpha (float): similarity weighting coefficient; 0 means equal weights.
+        """
         self.pred_action_horizon = pred_action_horizon
         self.action_history = deque(maxlen=self.pred_action_horizon)
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
 
     def reset(self):
+        """Clear the prediction history queue (call at episode start to avoid cross-task interference)."""
         self.action_history.clear()
 
     def ensemble_action(self, cur_action):
+        """Adaptively ensemble the current prediction with the historical predictions.
+
+        Args:
+            cur_action (np.ndarray): current predicted action. Either 1-D with shape
+                [action_dim] (single action), or 2-D with shape [horizon, action_dim]
+                (action chunk; in that case the k-th most recent historical prediction
+                contributes its step-k action, aligned with the current time step).
+
+        Returns:
+            np.ndarray: the ensembled action (weighted average over historical predictions),
+            shaped like a single-step action.
+        """
         self.action_history.append(cur_action)
         num_actions = len(self.action_history)
         if cur_action.ndim == 1:
@@ -75,6 +115,18 @@ class AdaptiveEnsembler:
 
 
 def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
+    """Center-crop the image and resize it to 224x224 (matching training-time image augmentation).
+
+    Args:
+        image (np.ndarray | Image.Image): input image. ndarray supports float ([0,1] or
+            [0,255], auto-detected), uint16 (divided by 257 to map onto 8-bit), uint8, etc.
+
+    Returns:
+        Image.Image: RGB PIL image, center-cropped by area ratio crop_scale=0.9 and
+        bilinearly resized to (224, 224).
+
+    Note: crop_scale is an area ratio, so the side-length scale is sqrt(0.9), not 0.9.
+    """
     crop_scale = 0.9
     side_scale = float(np.sqrt(np.clip(crop_scale, 0.0,
                                        1.0)))  # side length scale
@@ -118,6 +170,20 @@ def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
 
 
 def resize_with_pad(img, width, height, pad_value=-1):
+    """Aspect-preserving resize of a (B, C, H, W) image tensor to the target size, padding on the left/top with pad_value.
+
+    Args:
+        img (torch.Tensor): input image batch of shape (B, C, H, W); if given as
+            (B, H, W, C) (channels last with C in {1,3}) it is permuted to channels-first.
+        width (int): target width in pixels.
+        height (int): target height in pixels.
+        pad_value (float): padding value, default -1.
+
+    Returns:
+        torch.Tensor: image of shape (B, C, height, width); first scaled bilinearly by the
+        long-side ratio, then the missing area is padded on the left/top sides (unlike
+        image_tools.resize_with_pad, which pads symmetrically/centered).
+    """
     # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
@@ -149,6 +215,13 @@ class PolicyPreprocessMixin:
     """
     A mixin class that provides preprocessing utilities for observations.
     Can be mixed into any policy class to add image, state, action, language handling.
+
+    Notes (added): observation-preprocessing mixin — provides the three preparation
+    functions for images (prepare_images), state (prepare_state) and language
+    (prepare_language), plus the full select_action inference entry. Combined via
+    multiple inheritance with veomni's PI0Policy / QwenPI0Policy to form the inference
+    policy classes below; relies on the mixed-in class providing self.config,
+    self.image_processor, self.language_tokenizer and self.model.
     """
 
     def prepare_images(self, observation: dict[str, Tensor]):
@@ -160,6 +233,13 @@ class PolicyPreprocessMixin:
         Returns:
             images (torch.Tensor): (*b, n, c, h, w) images in range [-1.0, 1.0]
             img_masks (torch.Tensor): (*b, n) masks for images, True if image is present, False if missing
+
+        Notes (added): iterates over the three camera keys in the fixed IMAGE_KEYS order
+        (base / left wrist / right wrist): each present image is resize_with_pad-ed to
+        config.resize_imgs_with_padding (pad value 0) and normalized to [-1,1] by
+        image_processor; missing cameras get all-zero placeholders with mask=False.
+        Finally stacked into an (n, c, h, w) tensor (n=3) and moved, together with the
+        mask, to the device of state.
         """
         dtype = observation["state"].dtype
         bsize = observation["state"].shape[0]
@@ -195,6 +275,16 @@ class PolicyPreprocessMixin:
         return images, img_masks
 
     def prepare_state(self, observation):
+        """Convert the observation's robot state to a tensor and right-pad it to max_state_dim.
+
+        Args:
+            observation (dict): observation dict; observation["state"] is an np.ndarray
+                of shape (B, state_dim).
+
+        Returns:
+            torch.Tensor: state tensor of shape (B, max_state_dim) (missing dims padded
+            with 0, so robots with different DoF share the same model input width).
+        """
         state = torch.from_numpy(observation["state"])
         if isinstance(state, np.ndarray):
             state = torch.from_numpy(state)
@@ -216,6 +306,11 @@ class PolicyPreprocessMixin:
         Returns:
             lang_tokens (torch.Tensor): (*b, l) language tokens
             lang_masks (torch.Tensor): (*b, l) masks for language tokens, True if token is present, False if missing
+
+        Notes (added): provide either raw prompt strings (this function prepends <bos>,
+        appends the newline separator, tokenizes and right-pads to
+        config.tokenizer_max_length), or pre-tokenized lang_tokens/lang_masks (moved
+        directly to the device of state).
         """
         lang_tokens = observation.get("lang_tokens", None)
         lang_masks = observation.get("lang_masks", None)
@@ -254,6 +349,18 @@ class PolicyPreprocessMixin:
     def select_action(self,
                       observation: dict[str, Tensor],
                       noise: Tensor | None = None):
+        """Full single-step inference entry: preprocess the observation, then sample an action chunk with the underlying PI0 model.
+
+        Args:
+            observation (dict[str, Tensor]): observation dict (image / state / prompt,
+                or lang_tokens / lang_masks).
+            noise (Tensor | None): reserved argument, currently unused (could specify the
+                initial noise for flow-matching sampling).
+
+        Returns:
+            torch.Tensor: sampled action chunk (in normalized space), shape approximately
+            (B, action_horizon, action_dim); runs under no_grad + eval mode with bf16.
+        """
         self.eval()
         images, img_masks = self.prepare_images(observation)
         state = self.prepare_state(observation)
@@ -272,14 +379,31 @@ class PolicyPreprocessMixin:
 
 
 class QwenPI0InferencePolicy(PolicyPreprocessMixin, QwenPI0Policy):
+    """QwenPI0 inference policy: combines the preprocessing mixin with veomni's QwenPI0Policy (no extra logic)."""
     pass  # Only combine necessary functions
 
 
 class PI0InfernecePolicy(PolicyPreprocessMixin, PI0Policy):
+    """PI0 (PaliGemma backbone) inference policy: combines the preprocessing mixin with veomni's PI0Policy (no extra logic)."""
     pass  # Only combine necessary functions
 
 
 def merge_qwen_config(policy_config, qwen_config):
+    """Merge Qwen2.5-VL backbone config entries into the lerobot-style policy config.
+
+    Args:
+        policy_config: PI0 policy config object (PreTrainedConfig etc., supports setattr), modified in place.
+        qwen_config: Qwen2.5-VL AutoConfig object or its dict form.
+
+    Returns:
+        The merged policy_config (same object).
+
+    Notes: a policy checkpoint's config only stores the PI0 head hyperparameters; building
+    the full model also needs the LLM backbone structure — the text_keys set lists the keys
+    to sync (hidden size / num layers / num attention heads / RoPE theta / vocab size /
+    activation, etc.); vision_config (the ViT vision-tower config) is copied wholesale when
+    present, otherwise a warning is printed.
+    """
     if hasattr(qwen_config, 'to_dict'):
         config_dict = qwen_config.to_dict()
     else:
@@ -316,6 +440,17 @@ def merge_qwen_config(policy_config, qwen_config):
 class QwenPiServer:
     '''
     policy wrapper to support action ensemble or chunk execution
+
+    Notes (added): websocket-deployment wrapper around the QwenPI0 policy (can be passed
+    directly as the policy argument of WebsocketPolicyServer). Two action-execution modes
+    (controlled by use_length):
+    - use_length > 0: chunk execution — a real inference runs only every use_length steps
+      to produce an action chunk, whose actions are replayed in order in between
+      (lower inference frequency);
+    - use_length == -1: adaptive ensembling — inference runs every step and
+      AdaptiveEnsembler weights it against historical predictions (smoother actions).
+    Also handles state normalization / action unnormalization (mean/std scheme, statistics
+    loaded from norm_stats.json).
     '''
 
     def __init__(
@@ -326,6 +461,15 @@ class QwenPiServer:
         use_length=1,  # to control the execution length of the action chunk, -1 denotes using action ensemble
         use_bf16=True,
     ) -> None:
+        """Initialize the wrapper: build the ensembler, load the VLA model and move it to GPU.
+
+        Args:
+            path_to_pi_model (str): PI0 policy weights directory (hf_ckpt, with config and *.safetensors).
+            adaptive_ensemble_alpha (float): similarity exponent coefficient for adaptive ensembling (only used when use_length=-1).
+            action_ensemble_horizon (int): ensemble sliding-window length (how many recent predictions to keep).
+            use_length (int): chunk execution length; a real inference runs every use_length steps; -1 switches to action-ensembling mode.
+            use_bf16 (bool): whether to cast the model to bfloat16 for inference (halves GPU memory).
+        """
 
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.action_ensemble_horizon = action_ensemble_horizon
@@ -333,13 +477,16 @@ class QwenPiServer:
 
         self.task_description = None
 
+        # Adaptive action ensembler (used in use_length=-1 mode)
         self.action_ensembler = AdaptiveEnsembler(self.action_ensemble_horizon,
                                                   self.adaptive_ensemble_alpha)
 
+        # Load the VLA model (weights, tokenizer/processor, normalization statistics) and set eval mode
         self.vla = self.load_vla(path_to_pi_model)
         self.vla = self.vla.to("cuda").eval()
         if use_bf16:
             self.vla = self.vla.to(torch.bfloat16)
+        # Server-side global step counter: decides when to re-run inference and which action to take from the chunk
         self.global_step = 0
         self.last_action_chunk = None
 
@@ -350,6 +497,11 @@ class QwenPiServer:
             action_dim=14):
         '''
         TODO: show be rewritten as a dict
+
+        Notes (added): loads state/action mean/std normalization statistics from
+        norm_stats.json (taking the stack_bowls_three-aloha-agilex_clean_50_rep task
+        entry), truncated to the first state_dim / action_dim dims (default 14 = dual
+        arm 7+7), stored as instance attributes for state_normalizer / action_unnormalizer.
         '''
         with open(states_path) as f:
             norm_stats = json.load(
@@ -368,18 +520,36 @@ class QwenPiServer:
             dtype=np.float32)
 
     def state_normalizer(self, unnorm_state):
+        """Normalize the state: (state - mean) / (std + 1e-6); input/output are np.ndarray."""
         state = (unnorm_state - self.state_mean) / (self.state_std + 1e-6)
         return state
 
     def action_unnormalizer(self, norm_action):
+        """Unnormalize the action: action * (std + 1e-6) + mean, restoring physical units from model output."""
         action = norm_action * (self.action_std + 1e-6) + self.action_mean
         return action
 
     def load_vla(self, path_to_pi_model) -> QwenPI0Policy:
+        """Load the QwenPI0/PI0 policy model with its tokenizer/processor.
+
+        Steps: read the policy config -> merge the Qwen2.5-VL backbone config
+        (merge_qwen_config) -> pick QwenPI0InferencePolicy / PI0InfernecePolicy by path
+        name -> merge and load all *.safetensors shards in the directory (strict=True) ->
+        attach tokenizer/processor/image_processor -> initialize normalization statistics
+        (init_norm).
+
+        Args:
+            path_to_pi_model (str): policy weights directory (hf_ckpt).
+
+        Returns:
+            QwenPI0Policy: inference policy object ready for select_action (built on CPU;
+            __init__ moves it to GPU).
+        """
         # load model
         print(f"loading model from: {path_to_pi_model}")
         config = PreTrainedConfig.from_pretrained(path_to_pi_model)
 
+        # Qwen2.5-VL-3B backbone path (provides the LLM/ViT structure config and tokenizer/processor)
         base_model_path = '/home/yangshuai/yangshuai_ssd0/rep/VLA_pretraining/checkpoints/Qwen2.5-VL-3B-Instruct'
 
         qwen_config = AutoConfig.from_pretrained(base_model_path)
@@ -393,6 +563,7 @@ class QwenPiServer:
 
         print('Initializing model ... ')
 
+        # Pick the backbone by weights path name: contains 'qwen' -> QwenPI0, otherwise the PaliGemma-based PI0
         if 'qwen' in path_to_pi_model:
             policy = QwenPI0InferencePolicy(config)
         else:
@@ -400,6 +571,7 @@ class QwenPiServer:
             policy = PI0InfernecePolicy(config)
 
         # Merge multiple safetensor weights
+        # FSDP-saved weights are usually multiple safetensors shards; read them all and merge into one state_dict
         all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
         merged_weights = {}
 
@@ -411,6 +583,7 @@ class QwenPiServer:
         policy.load_state_dict(merged_weights, strict=True)
 
         # Load data processors
+        # Attach tokenizer/processor to the policy for the PolicyPreprocessMixin preprocessing functions
         policy.language_tokenizer = language_tokenizer
         policy.processor = processor
         policy.image_processor = processor.image_processor
@@ -421,6 +594,10 @@ class QwenPiServer:
         return policy
 
     def reset(self) -> None:
+        """Reset inference state: clear ensembler history, zero the step counter, drop the cached action chunk.
+
+        Triggered at the start of each episode when the client sends ``dict(reset=True)`` (see infer).
+        """
         if self.use_length == -1:
             self.action_ensembler.reset()
 
@@ -429,6 +606,12 @@ class QwenPiServer:
 
     def infer(self, observation, center_crop=True):
         """Generates an action with the VLA policy."""
+        # Notes (added): single-step inference entry of the websocket server (observation is the dict sent by the client). Flow:
+        # 1) observation contains reset=True -> reset internal state and return dict(action=None);
+        # 2) normalize state with mean/std (raw value kept for debugging);
+        # 3) chunk mode (use_length>0): call vla.select_action only every use_length steps to get
+        #    a normalized action chunk and cache it; ensemble mode (use_length==-1): infer every step and ensemble adaptively;
+        # 4) take the current step's action -> unnormalize -> truncate to the first 14 dims (dual arm 7+7, hard-coded, to be removed) -> return dict(action=...).
 
         # (If trained with image augmentations) Center crop image and then resize back up to original size.
         # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
@@ -437,19 +620,24 @@ class QwenPiServer:
             self.reset()
             return dict(action=None)
 
+        # Keep the unnormalized state (for debugging) and replace the observation's state with its normalized version
         unnorm_state = observation['state']
         observation['state'] = self.state_normalizer(observation['state'])
 
+        # Chunk mode: infer once every use_length steps; ensemble mode (-1): infer every step
         if self.use_length == -1 or self.global_step % self.use_length == 0:
             normalized_actions = self.vla.select_action(observation).squeeze(0)
             self.last_action_chunk = normalized_actions.float().cpu().numpy()
             self.last_state = unnorm_state
 
         if self.use_length > 0:
+            # Take one action from the cached chunk at the current step (replay within the chunk)
             action = self.last_action_chunk[self.global_step % self.use_length]
         elif self.use_length == -1:  # do ensemble
+            # Ensemble mode: similarity-weighted average with historical predictions
             action = self.action_ensembler.ensemble_action(normalized_actions)
 
+        # Unnormalize back to physical units and truncate to the first 14 dims (dual arm 7+7)
         action = self.action_unnormalizer(
             action[:14])  # TODO: remove the hard code dim!
         action = action[:14]  # + self.last_state[0,:14]
@@ -462,6 +650,8 @@ class QwenPiServer:
         return dict(action=action)
 
 
+# Manual debug entry: load QwenPI0 weights (use_length=50, i.e. infer once every 50 steps and replay within the chunk),
+# then serve it with WebsocketPolicyServer on port 8002
 if __name__ == "__main__":
 
     from .websocket_policy_server import WebsocketPolicyServer

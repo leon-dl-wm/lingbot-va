@@ -1,6 +1,23 @@
 """
 Mostly copied from transforms3d library
 
+Notes: 3D geometry transformation utilities — conversions between the four rotation
+representations: quaternion / Euler angles / rotation matrix / axis-angle, mostly copied
+from the transforms3d library. In the evaluation loop, the RoboTwin client
+``eval_polict_client_openpi.py`` uses ``euler2quat`` from this module to convert the
+14-dim Euler-angle actions output by the model into the quaternion representation
+required by the simulation environment.
+
+Conventions (consistent with transforms3d; important when reading this code):
+- Quaternion order is **wxyz** (real part first), e.g. ``[1,0,0,0]`` is the identity
+  rotation; note this differs from scipy's ``Rotation.from_quat`` (xyzw order)!
+- Rotation matrices act on **column vectors** (left-multiplied onto coordinate vectors),
+  right-handed coordinate system, positive angles follow the right-hand rule
+  (counter-clockwise around the axis direction).
+- Euler angles are specified by an axes string (24 combinations, e.g. "sxyz"/"rzyx"):
+  the leading s/r denotes static (extrinsic) / rotating (intrinsic) axis frames, the
+  following three letters are the rotation axis order; the encoded tuple
+  (firstaxis, parity, repetition, frame) is looked up via _AXES2TUPLE.
 """
 
 import math
@@ -10,9 +27,11 @@ import numpy as np
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 # axis sequences for Euler angles
+# Cyclic axis index table: x->y->z->x, used to derive the other two rotation axes from firstaxis+parity
 _NEXT_AXIS = [1, 2, 0, 1]
 
 # map axes strings to/from tuples of inner axis, parity, repetition, frame
+# Bidirectional lookup table: axes string <-> encoded tuple (first axis, parity, repetition, frame)
 _AXES2TUPLE = {
     "sxyz": (0, 0, 0, 0),
     "sxyx": (0, 0, 1, 0),
@@ -75,6 +94,13 @@ def mat2euler(mat, axes="sxyz"):
     >>> R1 = euler2mat(al, be, ga, 'syxz')
     >>> np.allclose(R0, R1)
     True
+
+    Notes: Rotation matrix -> Euler angles (radians), the inverse of :func:`euler2mat`.
+    Implementation: first decode axes via the lookup table to get the (i,j,k) axis order,
+    then use one of two analytic branches depending on "repetition"; when sy/cy is close
+    to 0 the decomposition hits the gimbal-lock degenerate case and the third angle is
+    fixed to 0; parity (axis-order parity) decides whether all results are negated, and
+    frame (rotating/intrinsic) decides whether the first and last angles are swapped.
     """
     try:
         firstaxis, parity, repetition, frame = _AXES2TUPLE[axes.lower()]
@@ -88,6 +114,7 @@ def mat2euler(mat, axes="sxyz"):
 
     M = np.array(mat, dtype=np.float64, copy=False)[:3, :3]
     if repetition:
+        # Repetition case (e.g. sxyx): sy is the sine magnitude of the middle angle; sy≈0 means gimbal lock and az degenerates to 0
         sy = math.sqrt(M[i, j] * M[i, j] + M[i, k] * M[i, k])
         if sy > _EPS4:
             ax = math.atan2(M[i, j], M[i, k])
@@ -98,6 +125,7 @@ def mat2euler(mat, axes="sxyz"):
             ay = math.atan2(sy, M[i, i])
             az = 0.0
     else:
+        # Non-repetition case (e.g. sxyz): cy is the cosine magnitude of the middle angle; cy≈0 means gimbal lock
         cy = math.sqrt(M[i, i] * M[i, i] + M[j, i] * M[j, i])
         if cy > _EPS4:
             ax = math.atan2(M[k, j], M[k, k])
@@ -146,6 +174,10 @@ def quat2mat(q):
     >>> M = quat2mat([0, 1, 0, 0]) # 180 degree rotn around axis 0
     >>> np.allclose(M, np.diag([1, -1, -1]))
     True
+
+    Notes: Quaternion (**wxyz order**) -> 3x3 rotation matrix. The input need not be
+    pre-normalized (internally normalized via s=2/Nq); when the quaternion norm is close
+    to 0 (numerically degenerate), the identity matrix is returned directly.
     """
     w, x, y, z = q
     Nq = w * w + x * x + y * y + z * z
@@ -178,6 +210,14 @@ def isrotation(
     R: np.ndarray,
     thresh=1e-6,
 ) -> bool:
+    """Check whether a matrix is a valid rotation matrix (orthogonality: Rᵀ R ≈ I).
+
+    Args:
+        R: The (3,3) matrix to check.
+        thresh: Norm threshold for the deviation of Rᵀ R from the identity matrix.
+    Returns:
+        bool: True if the deviation norm is below thresh.
+    """
     Rt = np.transpose(R)
     shouldBeIdentity = np.dot(Rt, R)
     iden = np.identity(3, dtype=R.dtype)
@@ -213,6 +253,12 @@ def euler2mat(ai, aj, ak, axes="sxyz"):
     >>> R = euler2mat(1, 2, 3, (0, 1, 0, 1))
     >>> np.allclose(np.sum(R[0]), -0.383436184)
     True
+
+    Notes: Euler angles (radians) -> 3x3 rotation matrix, the inverse of :func:`mat2euler`.
+    Implementation: parity (axis-order parity) first negates all angles, frame
+    (rotating/intrinsic) swaps the first and last angles, then the matrix elements are
+    filled in one shot using pre-derived trigonometric identities, branched on
+    "repetition".
     """
     try:
         firstaxis, parity, repetition, frame = _AXES2TUPLE[axes]
@@ -287,6 +333,9 @@ def euler2axangle(ai, aj, ak, axes="sxyz"):
     True
     >>> theta
     1.5
+
+    Notes: Euler angles -> axis-angle representation (axis, theta); implemented internally
+    as the two-step conversion :func:`euler2quat` + :func:`quat2axangle`.
     """
     return quat2axangle(euler2quat(ai, aj, ak, axes))
 
@@ -316,6 +365,12 @@ def euler2quat(ai, aj, ak, axes="sxyz"):
     >>> q = euler2quat(1, 2, 3, 'ryxz')
     >>> np.allclose(q, [0.435953, 0.310622, -0.718287, 0.444435])
     True
+
+    Notes: Euler angles (radians) -> unit quaternion in **wxyz order** (q[0] is the real
+    part). This is the function used by the RoboTwin evaluation client to convert the
+    Euler angles of 14-dim actions into quaternions.
+    Implementation: angles are halved, then the three half-angle rotations are combined
+    directly via product-to-sum terms (cc/cs/sc/ss).
     """
     try:
         firstaxis, parity, repetition, frame = _AXES2TUPLE[axes.lower()]
@@ -409,6 +464,11 @@ def quat2axangle(quat, identity_thresh=None):
     In this case we return a 0 angle and an arbitrary vector, here [1, 0, 0].
 
     The algorithm allows for quaternions that have not been normalized.
+
+    Notes: Quaternion (**wxyz order**) -> axis-angle, returning ``(unit axis vector,
+    rotation angle theta)``. Conventions: an identity rotation (vector part ≈ 0) returns
+    the arbitrary axis [1,0,0] and angle 0; non-unit quaternions are normalized first;
+    non-finite values (NaN/inf) yield a NaN angle.
     """
     quat = np.asarray(quat)
     Nq = np.sum(quat**2)
@@ -430,6 +490,8 @@ def quat2axangle(quat, identity_thresh=None):
         # if vec is nearly 0,0,0, this is an identity rotation
         return np.array([1.0, 0, 0]), 0.0
     # Make sure w is not slightly above 1 or below -1
+    # theta = 2*acos(w): w is the cosine of the half angle; the clip prevents floating-point
+    # error from pushing |w| slightly above 1, which would make acos undefined
     theta = 2 * math.acos(max(min(quat[0], 1), -1))
     return xyz / math.sqrt(len2), theta
 
@@ -459,5 +521,9 @@ def quat2euler(quaternion, axes="sxyz"):
     >>> angles = quat2euler([0.99810947, 0.06146124, 0, 0])
     >>> np.allclose(angles, [0.123, 0, 0])
     True
+
+    Notes: Quaternion (**wxyz order**) -> Euler angles (radians); implemented by first
+    converting to a rotation matrix and then decomposing it
+    (:func:`quat2mat` + :func:`mat2euler`).
     """
     return mat2euler(quat2mat(quaternion), axes)

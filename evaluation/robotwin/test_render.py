@@ -1,3 +1,19 @@
+"""Sapien rendering environment self-check script.
+
+Role in the evaluation loop: RoboTwin evaluation depends on Sapien's ray-tracing renderer
+to produce camera images; if the rendering backend (GPU driver / Vulkan / shader config) is
+broken, evaluation would produce corrupted images or fail silently. This script builds a
+minimal scene to verify rendering capability: on success it prints a green "Render Well",
+on failure it prints a red "Render Error" and exits the process immediately (fail-fast).
+
+Typical usage::
+
+    python -m evaluation.robotwin.test_render
+    # eval_polict_client_openpi.py also runs Sapien_TEST() automatically at startup
+
+Note: the duplicated imports at the top of this file are historical artifacts and are
+intentionally kept as-is.
+"""
 import sys
 import warnings
 import os
@@ -42,8 +58,16 @@ from collections import OrderedDict
 
 
 class Sapien_TEST(gym.Env):
+    """Sapien rendering self-check environment: attempts to build a ray-tracing scene and
+    judges rendering capability by whether an exception is raised.
+
+    Instantiation alone triggers the check (see __init__); no step/reset calls are needed.
+    ``eval_polict_client_openpi.py`` constructs this class once before main as a precondition check.
+    """
 
     def __init__(self):
+        """Initialize: silence third-party library logging, then try to build the scene;
+        on failure print a red error and exit()."""
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
         try:
@@ -57,6 +81,16 @@ class Sapien_TEST(gym.Env):
         """
         Set the scene
             - Set up the basic scene: light source, viewer.
+
+        Notes (Chinese-original explanation, translated): creates the Sapien physics engine
+        and the ray-tracing ("rt") renderer, and configures:
+        - material/texture count limits (50000; evaluation scenes contain many objects, so
+          the defaults are not enough);
+        - ray-tracing parameters: 32 samples per pixel, path depth 8, OIDN denoiser — kept
+          identical to the real evaluation rendering quality, so passing this self-check
+          means evaluation rendering will work.
+        Any exception in these steps counts as a rendering self-check failure (caught by
+        __init__, which then exits).
         """
         self.engine = sapien.Engine()
         # declare sapien renderer

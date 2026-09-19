@@ -1,3 +1,32 @@
+"""LIBERO simulation evaluation client: runs LIBERO benchmark tests by connecting to the
+LingBot-VA inference server over websocket.
+
+Role in the evaluation loop (server side is ``wan_va/wan_va_server.py``, launched with the
+libero config):
+    1. Build the LIBERO off-screen rendering environment (OffScreenRenderEnv) and reset it
+       to the benchmark-provided initial state;
+    2. ``infer(dict(reset=True, prompt=...))``: the server clears its KV cache and encodes
+       the language instruction;
+    3. Send the initial observation (agentview + eye-in-hand camera images) to get the
+       action chunk ``action`` with shape [C, F, N]: C=7 (LIBERO single-arm EEF 6 dims +
+       1 gripper dim; the server maps the 30-dim unified action space back to these 7 dims
+       via ``used_action_channel_ids`` and denormalizes with q01/q99), F=number of latent
+       frames (2), N=control substeps per latent frame (16);
+    4. Execute the actions substep by substep, collecting one real-observation keyframe
+       every N/4 substeps (the Wan VAE downsamples time by 4x: 1 latent frame corresponds
+       to 4 real video frames);
+    5. Feed the keyframes back with ``compute_kv_cache=True``: the server first discards
+       the imagined-frame cache, then writes the real observations (update_cache=2),
+       completing closed-loop correction, and the next infer round begins; this repeats
+       until done or the environment timestep exceeds 800;
+    6. Save the side-by-side two-camera video (filename carries the True/False success
+       marker) and write per-task success-rate JSON files.
+
+Typical usage (see launch_client.sh)::
+
+    python evaluation/libero/client.py --libero-benchmark libero_10 \
+        --port 29056 --test-num 50 --task-range 0 10 --out-dir outputs/libero
+"""
 import numpy as np
 from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
 import argparse
@@ -13,6 +42,14 @@ import cv2
 
 
 def save_video(real_obs_list, save_path, fps=15, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
+    """Save the observation sequence as an mp4 video with cameras concatenated horizontally.
+
+    Args:
+        real_obs_list: List of observation dicts, each containing [H,W,3] uint8 images per camera.
+        save_path: Output mp4 path.
+        fps: Video frame rate.
+        video_names: Camera key names to concatenate, ordered left to right.
+    """
     if not real_obs_list:
         print("❌ No real observation frames")
         return
@@ -23,6 +60,7 @@ def save_video(real_obs_list, save_path, fps=15, video_names=["observation.image
     
     print(f"Saving video: {len(real_obs_list)} frames...")
 
+    # Per frame: resize every camera image to the agentview size, then hstack them into one row
     final_frames = [
         np.hstack([cv2.resize(obs[name], target_size) for name in video_names]).astype(np.uint8)
         for obs in real_obs_list
@@ -33,6 +71,15 @@ def save_video(real_obs_list, save_path, fps=15, video_names=["observation.image
 
 
 def construct_single_env(env_args):
+    """Build the LIBERO off-screen rendering environment, retrying up to 5 times on failure
+    (5 seconds apart).
+
+    Args:
+        env_args: OffScreenRenderEnv constructor arguments (bddl file path, camera height/width).
+    Returns:
+        The environment instance; None if all 5 attempts fail (rendering resources
+        occasionally fail to initialize, and retrying usually recovers).
+    """
     count = 0
     env = None
     env_creation = False
@@ -55,6 +102,11 @@ def _extract_obs(obs):
 
     Avoids torch round-trip: the env already returns uint8 numpy arrays [H, W, C].
     We just flip the vertical axis ([::-1]) and make a contiguous copy once.
+
+    Notes: Extracts the two camera images from the raw env obs and renames them to the keys
+    agreed with the server. LIBERO's MuJoCo-rendered images are upside down, so they are
+    flipped along the vertical axis ([::-1]); this operates directly on the numpy uint8
+    arrays ([H,W,3]) with a single contiguous copy, avoiding a torch tensor round-trip.
     """
     agentview = np.ascontiguousarray(obs["agentview_image"][::-1])
     eye_in_hand = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1])
@@ -62,6 +114,19 @@ def _extract_obs(obs):
 
 
 def init_single_env(env_in, init_state):
+    """Reset the environment to the benchmark-provided initial state and return the initial
+    observation.
+
+    First env.reset(), then set_init_state (guaranteeing reproducible object placement),
+    then execute 5 all-zero 7-dim actions to let the simulation settle; the last frame's
+    observation is used as the model's first input.
+
+    Args:
+        env_in: LIBERO environment instance.
+        init_state: A single initial-state array from benchmark.get_task_init_states.
+    Returns:
+        The initial observation dict (format see :func:`_extract_obs`).
+    """
     env_in.reset()
     env_in.set_init_state(init_state)
     for _ in range(5):
@@ -70,11 +135,30 @@ def init_single_env(env_in, init_state):
 
 
 def env_one_step(env_in, action):
+    """Execute a single environment step (7-dim EEF control: 6-dim pose delta + gripper);
+    returns (extracted observation, done)."""
     obs, _, done, _ = env_in.step(action)
     return _extract_obs(obs), done
 
 
 def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
+    """Run a single evaluation episode of the given task and save its video.
+
+    Flow: build env -> reset to the initial state and grab the initial observation ->
+    server reset(prompt) -> main loop {infer to get an action chunk -> execute substep by
+    substep -> collect a keyframe every N/4 substeps -> feed back via compute_kv_cache},
+    until done or the environment timestep exceeds 800 (LIBERO's per-episode step limit).
+
+    Args:
+        model: WebsocketClientPolicy client.
+        libero_benchmark: Benchmark name (e.g. "libero_10").
+        task_idx: Task index within the benchmark.
+        out_dir: Result root directory.
+        episode_idx: Episode index (taken modulo the initial-state array so different
+            episodes use different initial placements).
+    Returns:
+        bool: whether this episode succeeded (done).
+    """
     benchmark_dict = benchmark.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     num_tasks = benchmark_instance.get_num_tasks()
@@ -90,18 +174,32 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     cur_env = construct_single_env(env_args)
     first_obs = init_single_env(cur_env, init_states[episode_idx % init_states.shape[0]])
 
+    # Make the server clear its KV cache and encode the language instruction
+    # (the return value is unused; this call only resets the session)
     ret = model.infer(dict(reset=True, prompt=prompt))
 
     full_obs_list = []
     done = False
     first = True
+    # LIBERO caps each episode at 800 environment timesteps; exceeding it counts as failure
     while cur_env.env.timestep < 800:
+        # Only the first round carries the initial observation; afterwards first_obs stays
+        # None and the server continues autoregressive inference purely from the real-obs
+        # KV cache written via compute_kv_cache
         ret = model.infer(dict(obs=first_obs, prompt=prompt))
         action = ret['action']
 
         key_frame_list = []
+        # action shape [C=7, F, N]: F=number of latent frames, N=control substeps per latent frame.
+        # The Wan VAE downsamples time by 4x: 1 latent frame corresponds to 4 real video frames,
+        # so one real-observation keyframe is collected every N/4 substeps, keeping the
+        # feedback rate aligned with the latent frame rate.
         assert action.shape[2] % 4 == 0
         action_per_frame = action.shape[2] // 4
+        # The first round skips latent frame 0: its actions correspond to the "history"
+        # (aligned with the initial observation; the training data pipeline pads zero
+        # actions at the beginning), so executing them would repeat; all frames of later
+        # rounds are future actions.
         start_idx = 1 if first else 0
         for i in range(start_idx, action.shape[1]):
             for j in range(action.shape[2]):
@@ -121,8 +219,15 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         if done:
             break
         else:
+            # Feed the real-observation keyframes back: the server first drops imagined
+            # frames via clear_pred_cache, then writes the real observations with
+            # update_cache=2 (closed-loop correction); state carries the action chunk just
+            # executed, serving as the clean action-condition segment in the KV cache
+            # (aligned with the training sequence layout).
             model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
 
+    # The video filename carries the True/False success marker so statistics scripts can
+    # aggregate success rates directly from filenames
     out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
     out_file.parent.mkdir(exist_ok=True, parents=True)
 
@@ -140,6 +245,21 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
 def run(libero_benchmark, port, out_dir, test_num, task_range=None):
     '''
         task_range: [start, end) for splitting tasks
+
+        Notes: Main evaluation loop — iterates over every task in task_range, runs
+        test_num episodes per task, and after each episode prints the running success
+        rate and writes ``<out_dir>/<benchmark>_<task_idx>.json``.
+        task_range enables multi-process work splitting: different workers evaluate
+        disjoint task intervals. When video_save_root_dict is not None, evaluation can
+        resume (scanning saved videos to restore the success count and skipping finished
+        episodes); it defaults to None, i.e. the feature is disabled.
+
+        Args:
+            libero_benchmark: Benchmark name (libero_10/libero_goal/libero_spatial/libero_object).
+            port: Inference server websocket port.
+            out_dir: Result root directory.
+            test_num: Number of episodes to evaluate per task.
+            task_range: [start, end) task index interval; None means evaluate all tasks.
     '''
     if task_range is None:
         benchmark_dict = benchmark.get_benchmark_dict()
@@ -152,6 +272,7 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
         progress_bar = tqdm(range(task_range[0], task_range[1]), total=num_tasks)
 
     print(f"#################### Use benchmark: {libero_benchmark}, num_tasks: {num_tasks} #############")
+    # Establish the websocket connection (blocks internally until the server is ready)
     model = WebsocketClientPolicy(port=port)
 
     video_save_root_dict = None
@@ -182,6 +303,8 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
 
 
 def main():
+    """Command-line entry: parse arguments (benchmark / task range / port / episode count /
+    output directory) and start the evaluation."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--libero-benchmark",

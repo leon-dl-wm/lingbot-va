@@ -1,6 +1,32 @@
+"""Evaluation result statistics script: compute RoboTwin per-task success rates from the
+visualization video filenames saved by the evaluation client.
+
+Role in the evaluation loop: after each episode, ``eval_polict_client_openpi.py`` saves a
+video as ``<save_root>/stseed-*/visualization/<task_name>/<id>_<prompt>_<True|False>.mp4``,
+where the trailing True/False directly marks the episode outcome; this script recursively
+scans those mp4 filenames, counts successes/failures and computes the success rate per task,
+and prints a table with the overall mean and per-class (CLASS 1/2/3) means.
+
+Typical usage::
+
+    python evaluation/robotwin/calc_stat.py results/stseed-10000/visualization [more roots...]
+"""
 from pathlib import Path
 
 def compute_success_rates(root_dir: str, true_suffix="True.mp4", false_suffix="False.mp4"):
+    """Scan all task subdirectories under the root directory, count success/failure videos
+    by filename suffix, and compute success rates.
+
+    Args:
+        root_dir: Result root directory; each first-level subdirectory name corresponds to a task.
+        true_suffix: Filename suffix of success videos (default "True.mp4").
+        false_suffix: Filename suffix of failure videos (default "False.mp4").
+    Returns:
+        list of tuples ``(task name, success count, failure count, total, success rate)``;
+        the rate is None when the total is 0.
+    Raises:
+        FileNotFoundError: If the root directory does not exist.
+    """
     root = Path(root_dir)
     if not root.exists():
         raise FileNotFoundError(f"Root dir not found: {root}")
@@ -25,6 +51,9 @@ def compute_success_rates(root_dir: str, true_suffix="True.mp4", false_suffix="F
 
 
 # 你的三类：task -> 1/2/3
+# Task classification mapping: splits the 50 RoboTwin tasks into CLASS 1/2/3 by
+# difficulty/type, used by print_table to report per-class mean success rates;
+# tasks missing from this table are grouped into UNKNOWN and reported separately.
 TASK_CLASS = {
     "adjust_bottle": 1,
     "beat_block_hammer": 1,
@@ -79,11 +108,25 @@ TASK_CLASS = {
 }
 
 def mean_rate_of(results_subset):
+    """Compute the arithmetic mean of success rates over a subset of results; None (N/A)
+    entries are ignored, and None is returned if the subset is all None.
+
+    Args:
+        results_subset: Subset of the tuples returned by compute_success_rates
+            (the 5th element is the success rate).
+    """
     rates = [r[4] for r in results_subset if r[4] is not None]
     return (sum(rates) / len(rates)) if rates else None
 
 
 def print_table(results):
+    """Print the statistics table sorted by success rate (descending), with extra rows for
+    the overall mean, per-class (1/2/3) means, and the UNKNOWN mean.
+
+    Args:
+        results: List of tuples returned by compute_success_rates:
+            ``(task name, success count, failure count, total, success rate)``.
+    """
     # 按成功率排序：None(=N/A) 放最后，其余从高到低
     results = sorted(results, key=lambda r: (r[4] is None, -(r[4] or 0.0)))
 
@@ -118,6 +161,8 @@ def print_table(results):
         print(f"{'MEAN (UNKNOWN)':30s} {'':6s} {'':6s} {'':6s} {m_str:>12s}")
 
 
+# Command-line entry: accepts multiple result root directories, merges the statistics of
+# all tasks, and prints a single combined table.
 if __name__ == "__main__":
     import sys
 
