@@ -57,9 +57,11 @@ class FlowMatchScheduler():
                 video uses 5.0, action uses 1.0.
             sigma_max / sigma_min: upper/lower bounds of the noise level.
             inverse_timesteps: whether to flip the sigma sequence (ascending).
-            extra_one_step: when True, generate one extra step and drop the last entry so
-                the final sigma is exactly sigma_min (enabled for all inference in this
-                repo; with sigma_min=0 the last step has sigma=0, i.e. fully clean).
+            extra_one_step: when True, build an (N+1)-knot grid and drop the last knot, so
+                the N evaluation points are spaced by (start-min)/(N+1) and the final one
+                sits one spacing ABOVE sigma_min (enabled everywhere in this repo). With
+                sigma_min=0 this avoids wasting the last forward pass on an already-clean
+                sample; see the comment in set_timesteps.
             reverse_sigmas: whether to use 1-sigma (reversed noise semantics).
             exponential_shift / exponential_shift_mu: use the exponential form
                 sigma' = e^mu/(e^mu + 1/sigma - 1) instead of the linear shift
@@ -104,8 +106,17 @@ class FlowMatchScheduler():
         sigma_start = self.sigma_min + (self.sigma_max -
                                         self.sigma_min) * denoising_strength
         if self.extra_one_step:
-            # Take one extra step then drop the last entry: guarantees the final sigma
-            # is exactly sigma_min instead of overshooting past it
+            # Build an (N+1)-knot grid and drop the last knot ("N steps need N+1 knots").
+            # Both branches yield N evaluation points, but the spacing differs:
+            #   True  -> spacing (start-min)/(N+1); the last point sits ONE SPACING ABOVE
+            #            sigma_min
+            #   False -> spacing (start-min)/(N-1); the last point IS exactly sigma_min
+            # This matters because step() always jumps to sigma_=0 on the final index. With
+            # sigma_min=0 (this repo's setting) the False branch would place the last
+            # evaluation at sigma=0, i.e. on an already-clean sample, making that update
+            # (0 - 0) a no-op and wasting one forward pass. Keeping the last point above
+            # sigma_min means all N model evaluations land on meaningful noise levels and
+            # the final step performs the actual jump to fully clean.
             self.sigmas = torch.linspace(sigma_start, self.sigma_min,
                                          num_inference_steps + 1)[:-1]
         else:

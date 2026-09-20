@@ -16,9 +16,10 @@ Core mechanisms (mapping to the paper):
    denoising within a chunk".
 2. **Diffusion Forcing noise injection** (``Trainer._add_noise``): every latent frame
    samples its own timestep independently, with sigma broadcast along the frame dimension;
-   ``noisy_cond_prob=0.5`` also noises the clean condition segment for half of the steps,
-   simulating the fact that at inference time the KV cache holds error-carrying predicted
-   frames (the key trick for long-horizon AR stability).
+   ``noisy_cond_prob=0.5`` also noises the clean condition segment for half of the steps
+   (to a partially denoised level, sigma in [0, 0.5]), simulating the fact that at
+   inference time the KV cache holds error-carrying predicted frames (the key trick for
+   long-horizon AR stability).
 3. **Randomized chunk/window during training** (``_prepare_input_dict``): chunk_size~U{1..4}
    and window_size~U{4..64} are resampled every step ⇒ a single training run supports any
    chunk/window configuration at inference (deployment uses frame_chunk_size=2,
@@ -252,12 +253,20 @@ class Trainer:
         this trains the autoregressive ability of "denoising the current chunk conditioned
         on noisy history" — the essence of Diffusion Forcing.
 
-        With probability ``noisy_cond_prob`` the clean condition segment is also noised
-        (t sampled from the high-noise band [0.5, 1]): at inference time the KV cache holds
-        the model's own error-carrying "imagined" frames, so making the condition segment
-        dirty during training teaches the model to work on dirty history and suppresses
-        error accumulation over long AR rollouts (only video uses 0.5; the action condition
-        segment is always clean because actions come from real robot execution feedback).
+        With probability ``noisy_cond_prob`` the clean condition segment is also noised,
+        but only to a PARTIALLY denoised level: ``sample_timestep_id`` is called with
+        ``min_timestep_bd=0.5, max_timestep_bd=1.0``, which samples grid *indices* in
+        [500, 1000). Since index 0 is the noisiest (sigma=1) and index 999 the cleanest,
+        this yields sigma in [0, 0.5] -- the LOW-noise half. So the condition segment is
+        either fully clean or at least half clean, never heavily corrupted. In the paper's
+        convention (s = 1 - sigma) this is exactly ``s_aug in [0.5, 1]`` of the Noisy
+        History Augmentation. Rationale: at inference time the KV cache holds the model's
+        own error-carrying "imagined" frames, so training on partially noised history
+        teaches the model to read imperfect conditions and suppresses error accumulation
+        over long AR rollouts; it is also what makes ``video_exec_step`` truncation viable
+        (video can stop denoising halfway and still drive action prediction). Only video
+        uses 0.5; the action condition segment is always clean because actions come from
+        real robot execution feedback.
 
         Args:
             latent: tensor to noise. Video: VAE latents [B,48,F,H,W]; action:
@@ -319,11 +328,13 @@ class Trainer:
         latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
 
         # With probability noisy_cond_prob, also noise the clean condition segment: simulates
-        # the inference-time KV cache holding error-carrying predicted frames (dirty history),
-        # teaching the model to work on dirty conditions.
-        # t is sampled only from the high-noise band [0.5, 1]: the condition segment is either
-        # clean or "very dirty", matching the reality that imagined frames carry sizable errors
-        # at inference time.
+        # the inference-time KV cache holding error-carrying predicted frames, teaching the
+        # model to work on imperfect conditions.
+        # The noise level comes from the LOW-noise half, not the high-noise one:
+        # min/max_timestep_bd bound the grid INDEX (u*1000 in [500, 1000)), and index 0 is
+        # the noisiest (sigma=1) while index 999 is the cleanest, so sigma lands in [0, 0.5].
+        # The condition segment is thus either clean or only partially denoised (at least
+        # half clean) -- the paper's s_aug = 1 - sigma in [0.5, 1].
         if torch.rand(1).item() < noisy_cond_prob:
             cond_timestep_ids = sample_timestep_id(
                     batch_size=F,
@@ -376,8 +387,8 @@ class Trainer:
         #       latent_dict/action_dict are _add_noise outputs (with text_emb etc. attached).
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
-        # Video path: the condition segment is noised with 50% probability (dirty-history
-        # training — the key trick for long-horizon AR stability)
+        # Video path: the condition segment is noised with 50% probability, to a partially
+        # denoised level (sigma in [0, 0.5]) — the key trick for long-horizon AR stability
         latent_dict = self._add_noise(
             latent=batch_dict['latents'], 
             train_scheduler=self.train_scheduler_latent, 
