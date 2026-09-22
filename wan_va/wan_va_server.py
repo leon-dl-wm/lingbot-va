@@ -77,11 +77,14 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        # Load in fp32 (uniform dtype for FSDP2 lazy_init; _keep_in_fp32_modules
+        # would otherwise create a mixed fp32/bf16 parameter set), then let
+        # _configure_model/shard_model cast to param_dtype via MixedPrecisionPolicy.
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
-            torch_dtype=self.dtype,
-            torch_device=self.device,
+            torch_dtype=torch.float32,
+            torch_device='cpu',
             attn_mode="torch"
         )
         shard_fn = shard_model

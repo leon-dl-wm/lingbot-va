@@ -11,7 +11,10 @@ va_robotwin_i2va_eval_cfg.wan22_pretrained_model_name_or_path = os.environ.get(
     'EVAL_MODEL_PATH',
     va_robotwin_cfg.wan22_pretrained_model_name_or_path,
 )
-va_robotwin_i2va_eval_cfg.enable_offload = True  # fit alongside training (~18G)
+# Offload keeps VAE/text_encoder on CPU; UMT5-5B CPU encode takes ~25 min with
+# default threads, so only enable when sharing GPU with training. GPU-exclusive
+# eval (training stopped) should leave this False.
+va_robotwin_i2va_eval_cfg.enable_offload = False
 # Reduced attention window so eval can share a GPU with training (~14G free):
 # KV cache 7.2G->2.4G with window 24 (12 chunks of history, enough for a 10-chunk demo).
 va_robotwin_i2va_eval_cfg.attn_window = 24
