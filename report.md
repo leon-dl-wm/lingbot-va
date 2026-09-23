@@ -232,13 +232,14 @@ ls train_out/checkpoints/
 | 09-19 02:44 | 4935 | 0.1612 | 0.0011 | 0.05 | 45.66s/it | 49630MiB |
 | 09-19 03:14 | 4974 | 0.1857 | 0.0017 | 0.05 | 45.67s/it | 49938MiB |
 
-### i2va 评测 @ checkpoint_step_5000 (09-19 03:36)
+### i2va 评测 @ checkpoint_step_5000 (09-19 03:36)【当时失败,后已修复】
 
 ```
 patched attn_mode -> torch
-torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. port: 29501, useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use
+torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. port: 29501, useIpv6: false, code: -98, name: EADDRINUSE, address already in use
 ```
-- ⚠️ 评测失败(exit 0),完整日志: `/tmp/eval_step_5000.log`
+- ⚠️ 当时失败:评测与训练共用 MASTER_PORT 29501。**已修复**:评测改用独立端口 29699(`eval_checkpoint.sh`)。
+  最终成功结果见第 8 章(`train_out/eval/demo_step_5000.mp4`)。
 | 09-19 03:44 | 5014 | 0.1815 | 0.0017 | 0.03 | 45.66s/it | 47126MiB |
 | 09-19 04:14 | 5052 | 0.1950 | 0.0014 | 0.04 | 45.67s/it | 44836MiB |
 | 09-19 04:44 | 5091 | 0.1692 | 0.0010 | 0.03 | 45.68s/it | 48980MiB |
@@ -368,24 +369,28 @@ torch.distributed.DistNetworkError: The server socket has failed to listen on an
 | 09-21 18:44 | 9961 | 0.1738 | 0.0012 | 0.05 | 45.75s/it | 45850MiB |
 | 09-21 19:14 | 9999 | 0.1557 | 0.0017 | 0.04 | 45.74s/it | 2MiB |
 
-### i2va 评测 @ checkpoint_step_5000 (09-21 19:41)
+### i2va 评测 @ checkpoint_step_5000 (09-21 19:41)【当时失败,后已修复】
 
 ```
 patched attn_mode -> torch
     raise ChildFailedError(
 torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
 ```
-- ⚠️ 评测失败(exit 0),完整日志: `/tmp/eval_step_5000.log`
+- ⚠️ 当时失败(端口已修但暴露新问题):① FSDP2 混合 dtype 断言(server bf16 加载 +
+  `_keep_in_fp32_modules`);② imageio ffmpeg 插件缺失;③ offload 下 UMT5 CPU 编码 25 分钟。
+  **均已修复**(fp32 加载 + MixedPrecisionPolicy、安装 `imageio[ffmpeg]`、`enable_offload=False`)。
+  最终成功结果见第 8 章(`train_out/eval/demo_step_5000.mp4`)。
 | 09-21 19:44 | 训练进程已退出 | - | - | - | - | - |
 
-### i2va 评测 @ checkpoint_step_10000 (09-21 20:05)
+### i2va 评测 @ checkpoint_step_10000 (09-21 20:05)【当时失败,后已修复】
 
 ```
 patched attn_mode -> torch
     raise ChildFailedError(
 torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
 ```
-- ⚠️ 评测失败(exit 0),完整日志: `/tmp/eval_step_10000.log`
+- ⚠️ 当时失败,原因与修复同上。**09-22 重跑成功**:
+  `train_out/eval/demo_step_10000.mp4`(77 帧,7.7s,320×384),详见第 8 章。
 
 ---
 
