@@ -256,3 +256,69 @@ bash script/eval_checkpoint.sh <step>   # 输出 train_out/demo.mp4
 ---
 
 *相关文档:`project.md`(平台适配分析+原理)、`report.md`(30min 快照流水+评测日志)、`training_report.md`(训练专项)。本报告为总入口。*
+
+---
+
+## 9. 补充验证测试(2026-09-23,训练完成后)
+
+GPU 空闲后对系统做了 6 项补充验证,全部通过/完成:
+
+### 9.1 多 Checkpoint 质量演进(i2va)
+
+| checkpoint | demo | 数值一致性(vs 10K,cos-sim) |
+|---|---|---|
+| step_1000 | `train_out/eval/demo_step_1000.mp4` | 0.682(早期,动作策略未收敛) |
+| step_3000 | `train_out/eval/demo_step_3000.mp4` | 0.985 |
+| step_5000 | `train_out/eval/demo_step_5000.mp4` | 0.984 |
+| step_7000 | `train_out/eval/demo_step_7000.mp4` | 0.978 |
+| step_10000 | `train_out/eval/demo_step_10000.mp4` | 1.000(参考) |
+
+**结论**:3K 步后动作输出即高度一致(cos-sim>0.98),1K→3K 是动作策略收敛的关键区间;3K-10K 输出稳定,后续训练主要改善视频世界模型(latent loss 持续下降)。
+
+### 9.2 推理 Server 模式(websocket 闭环)✅
+
+模拟 RoboTwin 客户端协议完成完整闭环:
+
+```
+connect → reset(prompt) → infer(obs) → 15.9s 返回 action (16,2,16)
+→ kv_cache 更新(4 帧 obs + state)→ 0.52s → infer → 16.1s 返回 action
+```
+
+- action 数值有限、范围正常([-0.185, 0.984]),消息打包/obs 编码/action 后处理全链路通
+- **NVIDIA 客户端到位后可直接开跑仿真评测**
+- 发现并记录:VAE 流式编码第二次调用起需 ≥2 帧(time_conv 因果卷积核为 3),真实客户端每次反馈 4 帧 key_frame 满足要求
+
+### 9.3 推理延迟基准 ✅
+
+| 指标 | 值 |
+|---|---|
+| 单 chunk(2 latent 帧 = 8 视频帧 + 32 动作步) | **15.6s**(视频 25 步 + 动作 50 步去噪) |
+| 视频帧率 | 0.51 fps(生成侧) |
+| 动作频率 | 2.1 Hz |
+| 评测吞吐预估 | 50 任务 × 100 episodes × ~10 chunks/chunk ≈ 单卡数周 → **建议多卡**(需修 L1)或先用子集 |
+
+### 9.4 KV Cache 长时程测试(40 chunks > 窗口 36)✅
+
+- 40 chunks(317 帧,31.7s 视频)完整生成,零崩溃 → `train_out/eval/demo_step_10000_long40.mp4`
+- **延迟曲线**:15.6s(chunk 0)→ 18.9s(chunk 36+,窗口满)后稳定 —— 滑窗淘汰正常工作,无无界增长
+- 超窗后延迟 +21%,符合注意力窗口满载预期
+
+### 9.5 LIBERO Post-Training 冒烟(第二数据集)✅
+
+- 数据:libero_10(4G,含 latents);**修复**:500 个 parquet 的 HF 元数据 `List`→`Sequence`(datasets 3.6 不再支持旧 List 类型);生成 empty_emb.pt
+- 2 卡 FSDP2 训练 14 步:latent 0.157 / action 0.45→0.198(正常下降)/ grad 3.0→1.03(warmup 后稳定)
+- **结论**:非 robotwin 数据路径(env_type='none',无相对位姿变换)验证通过,LIBERO 正式训练可直接启动
+- 注:单卡会 OOM(5B fp32 + AdamW 超 64G),需 ≥2 卡 FSDP 分片
+
+### 9.6 测试小结
+
+| # | 测试 | 结果 |
+|---|---|---|
+| 1 | checkpoint 演进(1K/3K/5K/7K/10K) | ✅ 3K 后动作收敛 |
+| 2 | server 模式 websocket 闭环 | ✅ 16s/chunk,链路全通 |
+| 3 | 推理延迟基准 | ✅ 15.6s/chunk 稳态 |
+| 4 | KV cache 40 chunks 长时程 | ✅ 淘汰正常,延迟 +21% 后稳 |
+| 5 | LIBERO 冒烟 | ✅ 管线通(修 parquet schema) |
+| 6 | 数值一致性 | ✅ 与 #1 合并 |
+
+**系统状态:训练、推理、评测管线全部验证完毕,剩余唯一缺口是 RoboTwin 仿真 SR 数字(需 NVIDIA 客户端,见 7.4)。**
