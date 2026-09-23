@@ -4,9 +4,11 @@
 set -eu
 STEP=${1:?usage: eval_checkpoint.sh <step>}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BASE=/home/tione/notebook/model/lingbot-va-base
-CKPT="${REPO}/train_out/checkpoints/checkpoint_step_${STEP}"
-EVAL_DIR="${REPO}/train_out/eval/checkpoint_step_${STEP}"
+BASE=${BASE:-/home/tione/notebook/model/lingbot-va-base}
+CKPT_ROOT=${CKPT_ROOT:-${REPO}/train_out/checkpoints}
+EVAL_ROOT=${EVAL_ROOT:-${REPO}/train_out/eval}
+CKPT="${CKPT_ROOT}/checkpoint_step_${STEP}"
+EVAL_DIR="${EVAL_ROOT}/checkpoint_step_${STEP}"
 
 [ -d "${CKPT}/transformer" ] || { echo "checkpoint ${CKPT} not found"; exit 1; }
 
@@ -36,4 +38,10 @@ NGPU=1 CONFIG_NAME='robotwin_i2av_eval' \
 RC=$?
 tail -40 /tmp/i2va_server.log
 echo "=== output ==="
-ls -la "${REPO}/train_out/demo.mp4" 2>/dev/null || find "${REPO}" -maxdepth 2 -name "demo.mp4" -mmin -60 2>/dev/null || echo "check train_out/demo.mp4"
+if [ -f "${REPO}/train_out/demo.mp4" ]; then
+    mkdir -p "${EVAL_ROOT}"
+    cp "${REPO}/train_out/demo.mp4" "${EVAL_ROOT}/demo_step_${STEP}.mp4"
+    echo "demo archived: ${EVAL_ROOT}/demo_step_${STEP}.mp4"
+else
+    find "${REPO}" -maxdepth 2 -name "demo.mp4" -mmin -60 2>/dev/null || echo "check train_out/demo.mp4"
+fi
