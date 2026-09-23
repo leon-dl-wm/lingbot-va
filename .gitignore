@@ -1,1 +1,4 @@
 *.pyc
+train_out/**
+va_env/**
+
