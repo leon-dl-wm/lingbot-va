@@ -16,7 +16,7 @@
 4. [训练 Loss](#4-训练-loss)
 5. [资源占用](#5-资源占用)
 6. [Checkpoint 与评测结果](#6-checkpoint-与评测结果)
-7. [优化建议](#7-优化建议)
+7. [优化建议](#7-优化建议)(含 7.4 RoboTwin 仿真支持性评估)
 8. [复现命令速查](#8-复现命令速查)
 
 ---
@@ -152,6 +152,35 @@
 |---|---|---|
 | 多卡推理 server | L1 HCCL 缺陷 | 修 `sever_utils.py` 用字节 broadcast/gloo(已验证方案);或单卡跑 server |
 | RoboTwin 仿真 | 未跑 | NVIDIA 环境装 RoboTwin 客户端,连本机 server;这是拿到 SR 数字的最后一步 |
+
+### 7.4 RoboTwin 仿真 benchmark 在 BW1000 上的支持性评估(2026-09-23 实测)
+
+**结论:BW1000 不能本机跑 RoboTwin 仿真客户端(sapien 渲染被挡),但官方 server-client 架构天然支持"仿真在 NVIDIA、推理在 BW1000"的分离部署,推荐走此路径拿 SR 数字。**
+
+#### 实测证据链
+
+| # | 测试 | 结果 |
+|---|---|---|
+| 1 | BW1000 DRM render 节点(`/dev/dri/renderD128-135`)驱动 | `hycu`(海光**计算**驱动),非 `amdgpu` 图形驱动 → Mesa/RADV 图形栈无法绑定 GPU 渲染 |
+| 2 | 安装 `libvulkan1 + mesa-vulkan-drivers + vulkan-tools` | ✅ 可装,`vulkaninfo` 枚举到 **llvmpipe**(CPU Vulkan 设备,Mesa 23.2.1) |
+| 3 | sapien 3.0.3 与 3.0.0b1(RoboTwin 锁定版本)+ lavapipe 渲染 | ❌ `vk::PhysicalDevice::createDeviceUnique: ErrorExtensionNotPresent` |
+| 4 | 根因(`VK_LOADER_DEBUG=all` 定位) | sapien 硬编码要求 **`VK_KHR_external_semaphore_fd`**(CUDA↔Vulkan 互操作导出信号量),llvmpipe 是纯 CPU 设备**永不支持**该扩展(仅有 `external_memory_fd`) |
+| 5 | RADV(radeon ICD)直连 hycu 设备 | ❌ `Failed to detect any valid GPUs`——RADV 只认 amdgpu 内核驱动,与 hycu 不互通 |
+
+#### 三条路径评估
+
+| 路径 | 可行性 | 说明 |
+|---|---|---|
+| **A. 仿真客户端放 NVIDIA 机器(推荐)** | ✅ 架构原生支持 | `WebsocketClientPolicy` 连接 `ws://<host>:<port>`,与仿真进程完全解耦——RoboTwin 仿真(NVIDIA,vulkan+sapien 3.0.0b1)+ 推理 server(BW1000,`launch_server.sh` 单卡模式避开 HCCL L1 缺陷)。这正是官方 server-client 设计意图,推理负载仍在国产卡 |
+| B. BW1000 本机 CPU 渲染(llvmpipe) | ❌ 被硬需求挡死 | sapien 的 `VK_KHR_external_semaphore_fd` 互操作是编译期硬编码;除非改 sapien 源码去掉 CUDA interop(工作量大、上游不维护) |
+| C. 等海光图形栈支持 | ⏳ 未知 | 若未来 hycu/DTK 暴露 Vulkan ICD(对标 NVIDIA 的 CUDA-GL interop)才可能本机闭环;可携本报告证据向光合开发者社区提需求 |
+
+#### 路径 A 落地要点
+
+1. NVIDIA 机器:按官方 README 装 RoboTwin(vulkan 依赖 + sapien==3.0.0b1 + 资产包)
+2. BW1000 本机:checkpoint 的 `attn_mode` 改 `torch` 后启动 `bash evaluation/robotwin/launch_server.sh`(单卡)
+3. 客户端 `--port` 指向 server 端口,跨机网络需放通
+4. 多卡并行评测(50 任务分组)需先修 L1(字节 broadcast workaround,方案已验证)
 
 ## 8. 复现命令速查
 
