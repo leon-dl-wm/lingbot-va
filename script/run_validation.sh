@@ -6,6 +6,8 @@
 #      config 'robotwin_train_val' (identical to real training, just shorter)
 #   2. waits for checkpoint_step_<VAL_STEPS> to be saved
 #   3. runs i2va evaluation on that checkpoint and archives the demo video
+#   4. auto-generates final_report.md (script/gen_final_report.py) into
+#      ${SAVE_ROOT}/ and the repo root
 #
 # Usage:
 #   bash script/run_validation.sh                         # single node, detached
@@ -42,6 +44,8 @@
 #   ${SAVE_ROOT}/checkpoints/checkpoint_step_{500,1000}/   trained checkpoints
 #   ${SAVE_ROOT}/eval/checkpoint_step_1000/                eval model dir
 #   ${SAVE_ROOT}/eval/demo_step_1000.mp4                   generated demo video
+#   ${SAVE_ROOT}/loss_curves.png                           loss curves (report)
+#   ${SAVE_ROOT}/final_report.md + <repo>/final_report.md  auto-generated report
 #   /tmp/validation.log, /tmp/validation_train.log         logs
 set -uo pipefail
 
@@ -236,16 +240,39 @@ if [ "${PREFLIGHT_ONLY}" = "1" ]; then log "PREFLIGHT_ONLY=1, exiting"; exit 0; 
 # ================= Phase 1: training =================
 CKPT="${SAVE_ROOT}/checkpoints/checkpoint_step_${VAL_STEPS}"
 LAST_LOSS="skipped (checkpoint existed)"
+TRAIN_START_TS=$(date '+%Y-%m-%d %H:%M:%S')
+TRAIN_SECS=""
+GPU_MEM_PEAK_FILE="${SAVE_ROOT}/gpu_mem_peak_mib_node${NODE_RANK}.txt"
 if [ -f "${CKPT}/transformer/config.json" ] && [ "${FORCE}" != "1" ]; then
     log "checkpoint ${CKPT} already exists, skip training (FORCE=1 to retrain)"
+    TRAIN_END_TS=$(date '+%Y-%m-%d %H:%M:%S')
 else
     log "Phase 1: robotwin post-training ${VAL_STEPS} steps on $((NGPU * NNODES)) GPUs (${NNODES} node(s) x ${NGPU})"
+    # sample peak GPU memory (max across cards) every 60s while training
+    (
+        peak=0
+        while true; do
+            m=$(hy-smi --showmeminfo vram 2>/dev/null \
+                | grep -oE "Used Memory \(MiB\): [0-9]+" | grep -oE "[0-9]+$" \
+                | sort -n | tail -1)
+            if [ -n "${m:-}" ] && [ "${m}" -gt "${peak}" ]; then
+                peak=${m}; echo "${peak}" > "${GPU_MEM_PEAK_FILE}"
+            fi
+            sleep 60
+        done
+    ) &
+    MEM_SAMPLER_PID=$!
+    trap '[ -n "${MEM_SAMPLER_PID:-}" ] && kill "${MEM_SAMPLER_PID}" 2>/dev/null' EXIT
     T0=$(date +%s)
     NGPU=${NGPU} NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} \
         CONFIG_NAME=robotwin_train_val MASTER_PORT=${MASTER_PORT} \
         bash "${REPO}/script/run_va_posttrain.sh" --save-root "${SAVE_ROOT}" 2>&1 | tee "${TRAIN_LOG}"
     RC=${PIPESTATUS[0]}
     T1=$(date +%s)
+    TRAIN_SECS=$((T1 - T0))
+    TRAIN_END_TS=$(date '+%Y-%m-%d %H:%M:%S')
+    kill "${MEM_SAMPLER_PID}" 2>/dev/null; wait "${MEM_SAMPLER_PID}" 2>/dev/null
+    MEM_SAMPLER_PID=""
     [ "${RC}" -eq 0 ] || die "training exited rc=${RC} (see ${TRAIN_LOG})"
     [ -f "${CKPT}/transformer/config.json" ] || die "training finished but ${CKPT} missing"
     LAST_LOSS=$(grep -oE "latent_loss=[0-9.]+, action_loss=[0-9.]+, step=[0-9]+" "${TRAIN_LOG}" | tail -1 || true)
@@ -280,3 +307,18 @@ log "train log  : ${TRAIN_LOG}"
 log "eval log   : /tmp/validation_eval.log"
 log "===================================================="
 log "VALIDATION PASSED"
+
+# ================= Phase 4: final report =================
+# Auto-generate final_report.md (format mirrors the hand-written one).
+# Written to both ${SAVE_ROOT}/final_report.md and the repo root.
+log "Phase 4: generating final_report.md"
+REPORT_TRAIN_LOG="${TRAIN_LOG}" REPORT_EVAL_LOG=/tmp/validation_eval.log \
+REPORT_SAVE_ROOT="${SAVE_ROOT}" REPORT_VAL_STEPS="${VAL_STEPS}" \
+REPORT_NGPU="${NGPU}" REPORT_NNODES="${NNODES}" \
+REPORT_MODEL_PATH="${MODEL_PATH}" REPORT_DATASET_PATH="${DATASET_PATH}" \
+REPORT_TRAIN_START="${TRAIN_START_TS}" REPORT_TRAIN_END="${TRAIN_END_TS}" \
+REPORT_TRAIN_SECS="${TRAIN_SECS}" \
+REPORT_OUTPUTS="${SAVE_ROOT}/final_report.md,${REPO}/final_report.md" \
+    "${REPO}/va_env/bin/python" "${REPO}/script/gen_final_report.py" \
+    && log "final report: ${SAVE_ROOT}/final_report.md , ${REPO}/final_report.md" \
+    || log "WARN: final report generation failed (non-fatal)"
