@@ -24,13 +24,14 @@
 #   trains multi-node via torchrun, and only worker-0 runs the eval phase.
 #   Code/data/checkpoints must live on the shared CFS mount.
 #
-# STORAGE_MOUNT_PATH (the CFS Turbo mount root) is injected by TI-ONE in both
-# notebooks (/home/tione/notebook) and task-mode jobs (/opt/ml/input/data).
-# The script exits immediately if it is empty.
+# STORAGE_MOUNT_PATH (the CFS Turbo mount root) is injected by TI-ONE in
+# notebooks (/home/tione/notebook); task-mode jobs (/opt/ml/input/data) may
+# not export it, so the script auto-detects it from the repo path
+# (<mount>/code/lingbot-va) or known mount points, and exits if none found.
 # All resolved env vars are printed in an "ENV" block at startup.
 #
 # Env overrides:
-#   STORAGE_MOUNT_PATH (required)  shared CFS Turbo mount root
+#   STORAGE_MOUNT_PATH (auto-detected if unset)  shared CFS Turbo mount root
 #   Hardware (GPU count/name/VRAM, CPU cores, memory) is auto-detected on each
 #   node (cgroup-aware) and logged; NGPU defaults to the detected GPU count.
 #   NGPU (auto)  NNODES (auto)  NODE_RANK (auto)  MASTER_ADDR (auto)
@@ -48,7 +49,25 @@ SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${REPO}"   # TI-ONE task containers may start in an arbitrary cwd
 
-# Shared CFS Turbo mount root, injected by TI-ONE.
+# Shared CFS Turbo mount root. TI-ONE injects STORAGE_MOUNT_PATH in notebooks,
+# but task-mode containers may not export it even though the CFS is mounted
+# (e.g. at /opt/ml/input/data). Auto-detect: the repo lives at
+# <mount>/code/lingbot-va in both environments; fall back to known mounts.
+if [ -z "${STORAGE_MOUNT_PATH:-}" ] \
+    && [ "$(basename "${REPO}")" = "lingbot-va" ] \
+    && [ "$(basename "$(dirname "${REPO}")")" = "code" ]; then
+    STORAGE_MOUNT_PATH=$(dirname "$(dirname "${REPO}")")
+    echo "[validation] STORAGE_MOUNT_PATH not set; derived from repo path: ${STORAGE_MOUNT_PATH}"
+fi
+if [ -z "${STORAGE_MOUNT_PATH:-}" ]; then
+    for cand in /opt/ml/input/data /home/tione/notebook; do
+        if [ -d "${cand}" ]; then
+            STORAGE_MOUNT_PATH="${cand}"
+            echo "[validation] STORAGE_MOUNT_PATH not set; using ${cand}"
+            break
+        fi
+    done
+fi
 if [ -z "${STORAGE_MOUNT_PATH:-}" ]; then
     echo "[validation] FATAL: STORAGE_MOUNT_PATH is empty - attach the CFS Turbo storage to the TI-ONE task" >&2
     exit 1
