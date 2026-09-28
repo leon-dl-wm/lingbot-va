@@ -1,6 +1,6 @@
 #!/bin/bash
 # Append training snapshot to report.md every 30 min
-REPORT=/home/tione/notebook/code/lingbot-va/report.md
+REPORT=${STORAGE_MOUNT_PATH:?'STORAGE_MOUNT_PATH is empty'}/code/lingbot-va/report.md
 LOG=/tmp/train.log
 while true; do
     if ! pgrep -f "wan_va.train" > /dev/null; then

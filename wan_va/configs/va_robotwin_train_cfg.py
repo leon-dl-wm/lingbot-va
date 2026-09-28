@@ -1,12 +1,14 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from easydict import EasyDict
+from .shared_config import STORAGE_MOUNT_PATH
 from .va_robotwin_cfg import va_robotwin_cfg
 import os
 
 va_robotwin_train_cfg = EasyDict(__name__='Config: VA robotwin train')
 va_robotwin_train_cfg.update(va_robotwin_cfg)
 
-va_robotwin_train_cfg.dataset_path = '/home/tione/notebook/data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500'
+va_robotwin_train_cfg.dataset_path = os.path.join(
+    STORAGE_MOUNT_PATH, 'data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500')
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = False
 va_robotwin_train_cfg.load_worker = 16

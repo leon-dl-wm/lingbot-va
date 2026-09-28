@@ -1,12 +1,15 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
-from .shared_config import va_shared_cfg
+from .shared_config import STORAGE_MOUNT_PATH, va_shared_cfg
 
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/home/tione/notebook/model/lingbot-va-base"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = os.path.join(
+    STORAGE_MOUNT_PATH, 'model/lingbot-va-base')
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2

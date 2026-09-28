@@ -1,12 +1,14 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from easydict import EasyDict
+from .shared_config import STORAGE_MOUNT_PATH
 from .va_libero_cfg import va_libero_cfg
 import os
 
 va_libero_train_cfg = EasyDict(__name__='Config: VA libero train')
 va_libero_train_cfg.update(va_libero_cfg)
 
-va_libero_train_cfg.dataset_path = '/home/tione/notebook/data/Robbyant/libero/libero_10/0.0.0'
+va_libero_train_cfg.dataset_path = os.path.join(
+    STORAGE_MOUNT_PATH, 'data/Robbyant/libero/libero_10/0.0.0')
 va_libero_train_cfg.empty_emb_path = os.path.join(va_libero_train_cfg.dataset_path, 'empty_emb.pt')
 va_libero_train_cfg.enable_wandb = False
 va_libero_train_cfg.load_worker = 16

@@ -4,7 +4,7 @@
 set -eu
 STEP=${1:?usage: eval_checkpoint.sh <step>}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BASE=${BASE:-/home/tione/notebook/model/lingbot-va-base}
+BASE=${BASE:-${MODEL_PATH:-${STORAGE_MOUNT_PATH:?'STORAGE_MOUNT_PATH is empty'}/model/lingbot-va-base}}
 CKPT_ROOT=${CKPT_ROOT:-${REPO}/train_out/checkpoints}
 EVAL_ROOT=${EVAL_ROOT:-${REPO}/train_out/eval}
 CKPT="${CKPT_ROOT}/checkpoint_step_${STEP}"

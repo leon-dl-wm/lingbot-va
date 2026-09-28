@@ -1,13 +1,16 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
-from .shared_config import va_shared_cfg
+from .shared_config import STORAGE_MOUNT_PATH, va_shared_cfg
 
 va_libero_cfg = EasyDict(__name__='Config: VA libero')
 va_libero_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_libero_cfg.wan22_pretrained_model_name_or_path = "/home/tione/notebook/model/lingbot-va-base"
+va_libero_cfg.wan22_pretrained_model_name_or_path = os.path.join(
+    STORAGE_MOUNT_PATH, 'model/lingbot-va-base')
 
 va_libero_cfg.attn_window = 30
 va_libero_cfg.frame_chunk_size = 4

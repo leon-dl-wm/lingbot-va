@@ -5,6 +5,11 @@ set -x
 umask 007
  
 NGPU=${NGPU:-"8"}
+# Multi-node (TI-ONE 任务式建模): NNODES = worker count, NODE_RANK = this worker's
+# index, MASTER_ADDR = worker-0 address. Platform injects these automatically.
+NNODES=${NNODES:-"1"}
+NODE_RANK=${NODE_RANK:-"0"}
+MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
@@ -32,14 +37,22 @@ log_rank=${LOG_RANK}
 torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 
+## torchrun rendezvous setting (multi-node when NNODES > 1)
+dist_args="--nproc_per_node=${num_gpu} --master_port ${master_port}"
+if [ "${NNODES}" -gt 1 ]; then
+    dist_args="${dist_args} --nnodes=${NNODES} --node_rank=${NODE_RANK} --master_addr=${MASTER_ADDR}"
+fi
+
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# TI-ONE task containers may start in an arbitrary cwd - make wan_va importable
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export PATH="${REPO_ROOT}/va_env/bin:$PATH"
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 python -m torch.distributed.run \
-    --nproc_per_node=${num_gpu} \
+    ${dist_args} \
     --local-ranks-filter=${log_rank} \
-    --master_port ${master_port} \
     --tee 3 \
     -m wan_va.train --config-name ${config_name} $overrides

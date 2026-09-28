@@ -255,7 +255,7 @@ bash script/eval_checkpoint.sh <step>   # 输出 train_out/demo.mp4
 
 ---
 
-*相关文档:`project.md`(平台适配分析+原理)、`report.md`(30min 快照流水+评测日志)、`training_report.md`(训练专项)。本报告为总入口。*
+*相关文档:`PROJECT.md`(平台适配分析+原理)、`report.md`(30min 快照流水+评测日志)、`training_report.md`(训练专项)。本报告为总入口。*
 
 ---
 

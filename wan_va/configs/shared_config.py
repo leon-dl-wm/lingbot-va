@@ -1,6 +1,12 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 import torch
 from easydict import EasyDict
+
+# Root of the shared CFS Turbo mount (TI-ONE injects STORAGE_MOUNT_PATH).
+# `or` (not just a get default) so an empty value cannot yield relative paths.
+STORAGE_MOUNT_PATH = os.environ.get('STORAGE_MOUNT_PATH') or '/home/tione/notebook'
 
 va_shared_cfg = EasyDict()
 
