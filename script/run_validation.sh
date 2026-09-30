@@ -101,7 +101,7 @@ MASTER_PORT=${MASTER_PORT:-29505}
 export MASTER_PORT VAL_STEPS
 SAVE_ROOT=${SAVE_ROOT:-${REPO}/train_out_val}
 export MODEL_PATH=${MODEL_PATH:-${STORAGE_MOUNT_PATH}/model/lingbot-va-base}
-export DATASET_PATH=${DATASET_PATH:-${STORAGE_MOUNT_PATH}/data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}
+export DATASET_PATH=${DATASET_PATH:-${STORAGE_MOUNT_PATH}/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}
 FORCE=${FORCE:-0}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
 LOG=${LOG:-/tmp/validation.log}

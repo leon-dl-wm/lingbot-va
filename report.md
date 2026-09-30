@@ -22,7 +22,7 @@
 | 项目 | 值 |
 |---|---|
 | 底座模型 | `modelscope download Robbyant/lingbot-va-base` → `/home/tione/notebook/model/lingbot-va-base`(transformer bf16 ~10G,attn_mode 已是 "flex" 无需改) |
-| 数据集 | `robotwin-clean-and-aug-lerobot`(98G tar.gz 分卷,解压后 414G)→ `/home/tione/notebook/data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500` |
+| 数据集 | `robotwin-clean-and-aug-lerobot`(98G tar.gz 分卷,解压后 414G)→ `/home/tione/notebook/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500` |
 | 数据规模 | 50 任务 × 500 episodes;82,414 个 VAE latent .pth;82,500 个 mp4;LeRobot v2.1 + action_config ✅ |
 | empty_emb.pt | 归档中不含,已用底座 UMT5 text_encoder 按推理侧 negative prompt 逻辑生成(空字符串,512×4096 bf16,seq_len=1) |
 
@@ -30,7 +30,7 @@
 
 | 配置 | 值 | 说明 |
 |---|---|---|
-| `dataset_path` | `/home/tione/notebook/data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500` | 必改 |
+| `dataset_path` | `/home/tione/notebook/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500` | 必改 |
 | `wan22_pretrained_model_name_or_path` | `/home/tione/notebook/model/lingbot-va-base` | 必改 |
 | `enable_wandb` | `False` | 官方脚本 wandb key 是占位符,必改 |
 | `batch_size` | 1(默认) | 8 卡 × 1 |

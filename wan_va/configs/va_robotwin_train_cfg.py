@@ -8,7 +8,7 @@ va_robotwin_train_cfg = EasyDict(__name__='Config: VA robotwin train')
 va_robotwin_train_cfg.update(va_robotwin_cfg)
 
 va_robotwin_train_cfg.dataset_path = os.path.join(
-    STORAGE_MOUNT_PATH, 'data/Robbyant/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500')
+    STORAGE_MOUNT_PATH, 'data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500')
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = False
 va_robotwin_train_cfg.load_worker = 16
