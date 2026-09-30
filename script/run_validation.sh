@@ -12,8 +12,14 @@
 # Usage:
 #   bash script/run_validation.sh                         # single node, detached
 #   NGPU=2 bash script/run_validation.sh                  # fewer GPUs
+#   NNODES=3 bash script/run_validation.sh 5000 --set gradient_accumulation_steps=1
+#                                                         # multi-node + config overrides
 #   VALIDATION_DETACHED=0 bash script/run_validation.sh   # foreground
 #   PREFLIGHT_ONLY=1 bash script/run_validation.sh       # preflight checks only
+#
+# Extra args after VAL_STEPS (e.g. --set key=value, or bare key=value pairs) are
+# forwarded verbatim to run_va_posttrain.sh -> wan_va.train, so config values
+# like gradient_accumulation_steps / batch_size can be overridden per run.
 #   FORCE=1 bash script/run_validation.sh                 # retrain even if ckpt exists
 #
 # Tencent TI-ONE 任务式建模 (task-mode training, e.g. HCC-BW1000 x3 nodes,
@@ -266,7 +272,7 @@ else
     T0=$(date +%s)
     NGPU=${NGPU} NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} \
         CONFIG_NAME=robotwin_train_val MASTER_PORT=${MASTER_PORT} \
-        bash "${REPO}/script/run_va_posttrain.sh" --save-root "${SAVE_ROOT}" 2>&1 | tee "${TRAIN_LOG}"
+        bash "${REPO}/script/run_va_posttrain.sh" --save-root "${SAVE_ROOT}" "$@" 2>&1 | tee "${TRAIN_LOG}"
     RC=${PIPESTATUS[0]}
     T1=$(date +%s)
     TRAIN_SECS=$((T1 - T0))

@@ -374,6 +374,15 @@ NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh
 NGPU=8 CONFIG_NAME='libero_train' bash script/run_va_posttrain.sh
 ```
 
+Config values can be overridden on the command line without editing the config
+files, either as bare `key=value` pairs or with repeatable `--set key=value`
+flags (values are type-inferred: int/float/bool/str):
+
+```bash
+bash script/run_va_posttrain.sh batch_size=1 gradient_accumulation_steps=8
+bash script/run_va_posttrain.sh --set gradient_accumulation_steps=1 --set learning_rate=2e-5
+```
+
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
 
 

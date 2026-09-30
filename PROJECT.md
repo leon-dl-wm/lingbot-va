@@ -709,10 +709,13 @@ cat robotwin-clean-and-aug-lerobot.tar.gz.* | tar xz
 
 ### 🟠 P1:两处必改的代码/脚本问题
 
-1. **`key=value` 命令行覆盖不工作**。README/第 6 章写的
-   `bash script/run_va_posttrain.sh batch_size=1 gradient_accumulation_steps=8` 会直接报
+1. **`key=value` 命令行覆盖不工作(已修复)**。README/第 6 章写的
+   `bash script/run_va_posttrain.sh batch_size=1 gradient_accumulation_steps=8` 原先会直接报
    `unrecognized arguments`——`train.py` 的 argparse 只接受 `--config-name` / `--save-root`。
-   **改参数必须编辑 `wan_va/configs/va_robotwin_train_cfg.py`。**
+   **现已支持**:`train.py` 新增 `--set key=value`(可重复)与裸 `key=value` 两种覆盖形式,
+   自动做 int/float/bool 类型推断;`run_validation.sh` 也会把 VAL_STEPS 之后的额外参数
+   原样转发给 `run_va_posttrain.sh`,例如
+   `NNODES=3 bash script/run_validation.sh 5000 --set gradient_accumulation_steps=1`。
 2. **wandb 必失败**。`run_va_posttrain.sh` 里 `WANDB_API_KEY="your key"` 是占位符,而配置
    `enable_wandb = True` → `wandb.login()` 必报错。**把配置里 `enable_wandb` 改为 `False`**(或填真实 key)。
 

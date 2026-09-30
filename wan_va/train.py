@@ -506,6 +506,44 @@ class Trainer:
         logger.info("Training completed!")
 
 
+def _parse_override_value(raw):
+    """Convert a --set value string to bool/int/float/str."""
+    low = raw.lower()
+    if low in ('true', 'yes'):
+        return True
+    if low in ('false', 'no'):
+        return False
+    if low in ('none', 'null'):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def apply_config_overrides(config, overrides, rank=None):
+    """Apply 'key=value' string overrides to the config (EasyDict).
+
+    Supports both '--set key=value' flags and bare 'key=value' positional args
+    (the form documented in README), e.g. gradient_accumulation_steps=1.
+    """
+    if rank is None:
+        rank = int(os.getenv("RANK", 0))
+    for item in overrides:
+        key, sep, raw = item.partition('=')
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"Invalid config override {item!r}: expected key=value")
+        config[key] = _parse_override_value(raw.strip())
+        if rank == 0:
+            logger.info(f"Config override: {key} = {config[key]!r}")
+
+
 def run(args):
     """Main entry point."""
     config = VA_CONFIGS[args.config_name]
@@ -522,6 +560,9 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+
+    if args.set:
+        apply_config_overrides(config, args.set, rank=rank)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -546,8 +587,21 @@ def main():
         default=None,
         help="Root directory for saving checkpoints",
     )
-
-    args = parser.parse_args()
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a config attribute, e.g. --set gradient_accumulation_steps=1 (repeatable)",
+    )
+    args, unknown = parser.parse_known_args()
+    # Also accept bare 'key=value' overrides (README form), e.g.
+    # `bash script/run_va_posttrain.sh batch_size=1 gradient_accumulation_steps=8`
+    for tok in unknown:
+        if '=' in tok:
+            args.set.append(tok)
+        else:
+            parser.error(f"unrecognized arguments: {tok}")
     run(args)
 
 
