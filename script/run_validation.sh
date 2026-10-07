@@ -20,7 +20,10 @@
 # Extra args after VAL_STEPS (e.g. --set key=value, or bare key=value pairs) are
 # forwarded verbatim to run_va_posttrain.sh -> wan_va.train, so config values
 # like gradient_accumulation_steps / batch_size can be overridden per run.
-#   FORCE=1 bash script/run_validation.sh                 # retrain even if ckpt exists
+#
+# Training ALWAYS runs: an existing checkpoint never skips it (validation must
+# cover the full pipeline); train.py starts fresh and overwrites checkpoints.
+# Delete SAVE_ROOT first if you need a fully clean slate.
 #
 # Tencent TI-ONE 任务式建模 (task-mode training, e.g. HCC-BW1000 x3 nodes,
 # 8 GPUs/node = 24 GPUs total):
@@ -108,7 +111,6 @@ export MASTER_PORT VAL_STEPS
 SAVE_ROOT=${SAVE_ROOT:-${REPO}/train_out_val}
 export MODEL_PATH=${MODEL_PATH:-${STORAGE_MOUNT_PATH}/model/lingbot-va-base}
 export DATASET_PATH=${DATASET_PATH:-${STORAGE_MOUNT_PATH}/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}
-FORCE=${FORCE:-0}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
 LOG=${LOG:-/tmp/validation.log}
 TRAIN_LOG=/tmp/validation_train.log
@@ -144,7 +146,7 @@ print_var() {
 log "===================== ENV ====================="
 log "[resolved by this script]"
 for v in REPO TIONE_TASK NNODES NODE_RANK NGPU VAL_STEPS SAVE_ROOT \
-         MODEL_PATH DATASET_PATH STORAGE_MOUNT_PATH FORCE PREFLIGHT_ONLY \
+         MODEL_PATH DATASET_PATH STORAGE_MOUNT_PATH PREFLIGHT_ONLY \
          LOG TRAIN_LOG VALIDATION_CHILD; do print_var "${v}"; done
 log "[TI-ONE / distributed platform]"
 for v in MASTER_ADDR MASTER_PORT WORLD_SIZE RANK LOCAL_RANK \
@@ -244,46 +246,46 @@ log "preflight passed"
 if [ "${PREFLIGHT_ONLY}" = "1" ]; then log "PREFLIGHT_ONLY=1, exiting"; exit 0; fi
 
 # ================= Phase 1: training =================
+# Always (re)train even if the checkpoint already exists: validation must cover
+# the full pipeline, and wan_va.train starts fresh (overwrites checkpoints).
 CKPT="${SAVE_ROOT}/checkpoints/checkpoint_step_${VAL_STEPS}"
-LAST_LOSS="skipped (checkpoint existed)"
+LAST_LOSS=""
 TRAIN_START_TS=$(date '+%Y-%m-%d %H:%M:%S')
 TRAIN_SECS=""
 GPU_MEM_PEAK_FILE="${SAVE_ROOT}/gpu_mem_peak_mib_node${NODE_RANK}.txt"
-if [ -f "${CKPT}/transformer/config.json" ] && [ "${FORCE}" != "1" ]; then
-    log "checkpoint ${CKPT} already exists, skip training (FORCE=1 to retrain)"
-    TRAIN_END_TS=$(date '+%Y-%m-%d %H:%M:%S')
-else
-    log "Phase 1: robotwin post-training ${VAL_STEPS} steps on $((NGPU * NNODES)) GPUs (${NNODES} node(s) x ${NGPU})"
-    # sample peak GPU memory (max across cards) every 60s while training
-    (
-        peak=0
-        while true; do
-            m=$(hy-smi --showmeminfo vram 2>/dev/null \
-                | grep -oE "Used Memory \(MiB\): [0-9]+" | grep -oE "[0-9]+$" \
-                | sort -n | tail -1)
-            if [ -n "${m:-}" ] && [ "${m}" -gt "${peak}" ]; then
-                peak=${m}; echo "${peak}" > "${GPU_MEM_PEAK_FILE}"
-            fi
-            sleep 60
-        done
-    ) &
-    MEM_SAMPLER_PID=$!
-    trap '[ -n "${MEM_SAMPLER_PID:-}" ] && kill "${MEM_SAMPLER_PID}" 2>/dev/null' EXIT
-    T0=$(date +%s)
-    NGPU=${NGPU} NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} \
-        CONFIG_NAME=robotwin_train_val MASTER_PORT=${MASTER_PORT} \
-        bash "${REPO}/script/run_va_posttrain.sh" --save-root "${SAVE_ROOT}" "$@" 2>&1 | tee "${TRAIN_LOG}"
-    RC=${PIPESTATUS[0]}
-    T1=$(date +%s)
-    TRAIN_SECS=$((T1 - T0))
-    TRAIN_END_TS=$(date '+%Y-%m-%d %H:%M:%S')
-    kill "${MEM_SAMPLER_PID}" 2>/dev/null; wait "${MEM_SAMPLER_PID}" 2>/dev/null
-    MEM_SAMPLER_PID=""
-    [ "${RC}" -eq 0 ] || die "training exited rc=${RC} (see ${TRAIN_LOG})"
-    [ -f "${CKPT}/transformer/config.json" ] || die "training finished but ${CKPT} missing"
-    LAST_LOSS=$(grep -oE "latent_loss=[0-9.]+, action_loss=[0-9.]+, step=[0-9]+" "${TRAIN_LOG}" | tail -1 || true)
-    log "training done in $(( (T1-T0)/60 )) min, checkpoint: ${CKPT}"
+if [ -e "${CKPT}" ]; then
+    log "checkpoint ${CKPT} already exists - retraining and overwriting"
 fi
+log "Phase 1: robotwin post-training ${VAL_STEPS} steps on $((NGPU * NNODES)) GPUs (${NNODES} node(s) x ${NGPU})"
+# sample peak GPU memory (max across cards) every 60s while training
+(
+    peak=0
+    while true; do
+        m=$(hy-smi --showmeminfo vram 2>/dev/null \
+            | grep -oE "Used Memory \(MiB\): [0-9]+" | grep -oE "[0-9]+$" \
+            | sort -n | tail -1)
+        if [ -n "${m:-}" ] && [ "${m}" -gt "${peak}" ]; then
+            peak=${m}; echo "${peak}" > "${GPU_MEM_PEAK_FILE}"
+        fi
+        sleep 60
+    done
+) &
+MEM_SAMPLER_PID=$!
+trap '[ -n "${MEM_SAMPLER_PID:-}" ] && kill "${MEM_SAMPLER_PID}" 2>/dev/null' EXIT
+T0=$(date +%s)
+NGPU=${NGPU} NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} \
+    CONFIG_NAME=robotwin_train_val MASTER_PORT=${MASTER_PORT} \
+    bash "${REPO}/script/run_va_posttrain.sh" --save-root "${SAVE_ROOT}" "$@" 2>&1 | tee "${TRAIN_LOG}"
+RC=${PIPESTATUS[0]}
+T1=$(date +%s)
+TRAIN_SECS=$((T1 - T0))
+TRAIN_END_TS=$(date '+%Y-%m-%d %H:%M:%S')
+kill "${MEM_SAMPLER_PID}" 2>/dev/null; wait "${MEM_SAMPLER_PID}" 2>/dev/null
+MEM_SAMPLER_PID=""
+[ "${RC}" -eq 0 ] || die "training exited rc=${RC} (see ${TRAIN_LOG})"
+[ -f "${CKPT}/transformer/config.json" ] || die "training finished but ${CKPT} missing"
+LAST_LOSS=$(grep -oE "latent_loss=[0-9.]+, action_loss=[0-9.]+, step=[0-9]+" "${TRAIN_LOG}" | tail -1 || true)
+log "training done in $(( (T1-T0)/60 )) min, checkpoint: ${CKPT}"
 log "last training loss: ${LAST_LOSS:-n/a}"
 
 if [ "${NODE_RANK}" != "0" ]; then
