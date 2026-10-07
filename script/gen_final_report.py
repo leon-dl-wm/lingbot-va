@@ -8,7 +8,7 @@ report whose structure mirrors the hand-written final_report.md (执行摘要 /
 All inputs come from environment variables set by run_validation.sh:
   REPORT_TRAIN_LOG   train log to parse        (default /tmp/validation_train.log)
   REPORT_EVAL_LOG    eval log to parse         (default /tmp/validation_eval.log)
-  REPORT_SAVE_ROOT   validation save root      (default train_out_val)
+  REPORT_SAVE_ROOT   validation save root      (default train_out)
   REPORT_VAL_STEPS   trained steps             (default 500)
   REPORT_NGPU        GPUs per node             (default 1)
   REPORT_NNODES      node count                (default 1)
@@ -156,7 +156,7 @@ def torch_version():
 def main():
     train_log = env("REPORT_TRAIN_LOG", "/tmp/validation_train.log")
     eval_log = env("REPORT_EVAL_LOG", "/tmp/validation_eval.log")
-    save_root = Path(env("REPORT_SAVE_ROOT", str(REPO / "train_out_val")))
+    save_root = Path(env("REPORT_SAVE_ROOT", str(REPO / "train_out")))
     val_steps = int(env("REPORT_VAL_STEPS", "500") or 500)
     ngpu = int(env("REPORT_NGPU", "1") or 1)
     nnodes = int(env("REPORT_NNODES", "1") or 1)

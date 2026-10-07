@@ -35,17 +35,23 @@ EOF
 cd "${REPO}"
 source /opt/dtk/env.sh
 echo "=== running i2va with checkpoint_step_${STEP} ==="
+# --save_root redirects server outputs (demo.mp4, real/) into EVAL_DIR; the
+# config default is ./train_out, which must stay reserved for real training.
+RC=0
 NGPU=1 CONFIG_NAME='robotwin_i2av_eval' \
     EVAL_MODEL_PATH="${EVAL_DIR}" \
     MASTER_PORT=${MASTER_PORT:-29699} \
-    bash script/run_launch_va_server_sync.sh > /tmp/i2va_server.log 2>&1
-RC=$?
+    bash script/run_launch_va_server_sync.sh --save_root "${EVAL_DIR}" > /tmp/i2va_server.log 2>&1 || RC=$?
 tail -40 /tmp/i2va_server.log
 echo "=== output ==="
-if [ -f "${REPO}/train_out/demo.mp4" ]; then
-    mkdir -p "${EVAL_ROOT}"
-    cp "${REPO}/train_out/demo.mp4" "${EVAL_ROOT}/demo_step_${STEP}.mp4"
+if [ "${RC}" -ne 0 ]; then
+    echo "i2va server failed (rc=${RC}), full log: /tmp/i2va_server.log"
+    exit "${RC}"
+fi
+if [ -f "${EVAL_DIR}/demo.mp4" ]; then
+    cp "${EVAL_DIR}/demo.mp4" "${EVAL_ROOT}/demo_step_${STEP}.mp4"
     echo "demo archived: ${EVAL_ROOT}/demo_step_${STEP}.mp4"
 else
-    find "${REPO}" -maxdepth 2 -name "demo.mp4" -mmin -60 2>/dev/null || echo "check train_out/demo.mp4"
+    echo "demo video missing: expected ${EVAL_DIR}/demo.mp4 (see /tmp/i2va_server.log)"
+    exit 1
 fi

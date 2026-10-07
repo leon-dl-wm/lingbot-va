@@ -46,12 +46,13 @@
 #   Hardware (GPU count/name/VRAM, CPU cores, memory) is auto-detected on each
 #   node (cgroup-aware) and logged; NGPU defaults to the detected GPU count.
 #   NGPU (auto)  NNODES (auto)  NODE_RANK (auto)  MASTER_ADDR (auto)
-#   VAL_STEPS (500)  MASTER_PORT (29505)  SAVE_ROOT (train_out_val)
+#   VAL_STEPS (500)  MASTER_PORT (29505)  SAVE_ROOT (train_out)
 #   MODEL_PATH  DATASET_PATH    LOG (/tmp/validation.log)
 #
 # Artifacts:
 #   ${SAVE_ROOT}/checkpoints/checkpoint_step_{500,1000}/   trained checkpoints
 #   ${SAVE_ROOT}/eval/checkpoint_step_1000/                eval model dir
+#   ${SAVE_ROOT}/eval/checkpoint_step_1000/{demo.mp4,real/} i2va server raw outputs
 #   ${SAVE_ROOT}/eval/demo_step_1000.mp4                   generated demo video
 #   ${SAVE_ROOT}/loss_curves.png                           loss curves (report)
 #   ${SAVE_ROOT}/final_report.md + <repo>/final_report.md  auto-generated report
@@ -108,7 +109,7 @@ if [ "${VAL_STEPS}" -ge 500 ] && [ $(( VAL_STEPS % 500 )) -ne 0 ]; then
 fi
 MASTER_PORT=${MASTER_PORT:-29505}
 export MASTER_PORT VAL_STEPS
-SAVE_ROOT=${SAVE_ROOT:-${REPO}/train_out_val}
+SAVE_ROOT=${SAVE_ROOT:-${REPO}/train_out}
 export MODEL_PATH=${MODEL_PATH:-${STORAGE_MOUNT_PATH}/model/lingbot-va-base}
 export DATASET_PATH=${DATASET_PATH:-${STORAGE_MOUNT_PATH}/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
