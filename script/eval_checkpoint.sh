@@ -15,7 +15,11 @@ EVAL_DIR="${EVAL_ROOT}/checkpoint_step_${STEP}"
 # Build eval model dir: symlink frozen components from base, copy transformer with attn_mode=torch
 mkdir -p "${EVAL_DIR}"
 for d in vae text_encoder tokenizer; do
-    [ -e "${EVAL_DIR}/${d}" ] || ln -s "${BASE}/${d}" "${EVAL_DIR}/${d}"
+    # Always refresh the symlinks: absolute links created under another mount
+    # point (notebook /home/tione/notebook vs task /opt/ml/input/data) dangle
+    # here, so [ -e ] is false yet plain ln -s fails with "File exists".
+    if [ -d "${EVAL_DIR}/${d}" ] && [ ! -L "${EVAL_DIR}/${d}" ]; then continue; fi
+    ln -sfn "${BASE}/${d}" "${EVAL_DIR}/${d}"
 done
 rm -rf "${EVAL_DIR}/transformer"
 cp -r "${CKPT}/transformer" "${EVAL_DIR}/transformer"
