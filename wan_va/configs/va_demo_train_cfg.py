@@ -21,5 +21,5 @@ va_demo_train_cfg.beta2 = 0.95
 va_demo_train_cfg.weight_decay = 1e-1
 va_demo_train_cfg.warmup_steps = 10
 va_demo_train_cfg.batch_size = 1 
-va_demo_train_cfg.gradient_accumulation_steps = 8
+va_demo_train_cfg.gradient_accumulation_steps = 1
 va_demo_train_cfg.num_steps = 2000 
